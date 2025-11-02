@@ -1,0 +1,29 @@
+{
+  "name": "cpu-serving-benchmarks",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "remoteEnv": {
+    "HF_HOME": "/workspaces/.cache/huggingface",
+    "PYTHONPATH": "/workspaces/cpu_serving"
+  },
+  "runArgs": [
+    "--hostname",
+    "cpu-serving",
+    "--name",
+    "cpu-serving"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python"
+      }
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh"
+}
