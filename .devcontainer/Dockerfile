@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -22,6 +22,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN git lfs install --system
+
+COPY requirements.txt /tmp/requirements.txt
+
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu \
