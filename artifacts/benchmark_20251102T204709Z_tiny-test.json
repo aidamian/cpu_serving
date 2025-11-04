@@ -1,0 +1,38 @@
+{
+  "generated_at": "2025-11-02T20:47:09.899316Z",
+  "system": {
+    "platform": "Linux-5.15.167.4-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+    "cpu": "",
+    "machine": "x86_64",
+    "python": "3.11.14",
+    "logical_cores": 12,
+    "physical_cores": 6,
+    "total_memory_bytes": 31546580992
+  },
+  "results": [
+    {
+      "backend": "huggingface",
+      "model": "sshleifer/tiny-gpt2",
+      "prompt": "Provide a concise technical summary of the Llama 3.1 8B model that focuses on CPU-only inference considerations, including memory footprint and expected latency.",
+      "prompt_tokens": 32,
+      "completion": "factors factors factors factors",
+      "completion_tokens": 4,
+      "max_new_tokens": 4,
+      "load_time_s": 1.8134849789785221,
+      "generate_time_s": 0.02241452701855451,
+      "peak_memory_bytes": 446128128,
+      "num_threads": 1,
+      "parameters": {
+        "dtype": "float32",
+        "revision": null,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "repetition_penalty": 1.0
+      },
+      "timestamp": "2025-11-02T20:47:09.881400Z",
+      "total_tokens": 36,
+      "tokens_per_second": 178.45569512525705,
+      "peak_memory_mebibytes": 425.4609375
+    }
+  ]
+}

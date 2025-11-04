@@ -1,79 +1,140 @@
 #!/usr/bin/env python
-"""Run the full CPU benchmark suite across HuggingFace, vLLM, and llama.cpp backends."""
+"""Run all CPU benchmarks using isolated virtual environments."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
-import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Iterable, List, Sequence, Tuple
 
-from cpu_serving.benchmarks import (
-    HFBenchmarkConfig,
-    LlamaCppBenchmarkConfig,
-    VLLMBenchmarkConfig,
-    aggregate_results,
-    format_results_table,
-    run_hf_benchmark,
-    run_llamacpp_benchmark,
-    run_vllm_benchmark,
-    write_results,
+from cpu_serving.venv_manager import (
+    VirtualEnvError,
+    available_backends,
+    ensure_virtualenv,
+    resolve_backend,
 )
 
 
-BACKEND_ALIASES = {
-    "hf": "huggingface",
-    "huggingface": "huggingface",
-    "vllm": "vllm",
-    "llamacpp": "llama.cpp",
-    "llama.cpp": "llama.cpp",
+_BACKEND_SCRIPTS: Dict[str, str] = {
+    "huggingface": "benchmark_hf.py",
+    "vllm": "benchmark_vllm.py",
+    "llamacpp": "benchmark_llamacpp.py",
 }
 
-ALL_BACKENDS = ("huggingface", "vllm", "llama.cpp")
+
+def _default_backends() -> List[str]:
+    return list(available_backends())
 
 
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+def _iter_backends(selected: Sequence[str]) -> Iterable[str]:
+    if not selected:
+        yield from _default_backends()
+        return
+    for name in selected:
+        yield resolve_backend(name)
+
+
+def _format_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
+    if not rows:
+        return "| " + " | ".join(headers) + " |\n| " + " | ".join("---" for _ in headers) + " |"
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for idx, value in enumerate(row):
+            widths[idx] = max(widths[idx], len(value))
+
+    def render(row: Sequence[str]) -> str:
+        return "| " + " | ".join(value.ljust(widths[idx]) for idx, value in enumerate(row)) + " |"
+
+    header_line = "| " + " | ".join(headers[idx].ljust(widths[idx]) for idx in range(len(headers))) + " |"
+    separator = "| " + " | ".join("-" * widths[idx] for idx in range(len(headers))) + " |"
+    body = "\n".join(render(row) for row in rows)
+    return "\n".join([header_line, separator, body])
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run CPU benchmarks across multiple Llama 3.1 8B inference stacks."
+        description="Run CPU benchmarks for all configured backends using isolated environments."
     )
     parser.add_argument(
         "--prompt",
         default=None,
-        help="Prompt string used for every backend.",
+        help="Prompt string to reuse for every backend.",
     )
     parser.add_argument(
         "--prompt-file",
         default=None,
-        help="Optional file containing the benchmark prompt.",
+        help="Path to a file containing the shared prompt.",
     )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=128,
-        help="Max completion tokens for all backends (can be overridden individually).",
+        help="Maximum completion tokens for each backend.",
     )
     parser.add_argument(
         "--backends",
-        nargs="+",
-        default=list(ALL_BACKENDS),
-        help="Subset of backends to run: hf, vllm, llamacpp. Defaults to all.",
+        nargs="*",
+        default=None,
+        help="Subset of backends to run (hf, vllm, llamacpp). Defaults to all.",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("artifacts"),
-        help="Directory where benchmark JSON reports will be stored.",
+        help="Directory to store per-backend and summary JSON outputs.",
     )
     parser.add_argument(
         "--label",
         default=None,
-        help="Optional label appended to the output filename for easier tracking.",
+        help="Optional label to embed in output filenames.",
     )
 
-    # HuggingFace specific options
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Shared generation temperature.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Shared top-p value.",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.0,
+        help="Shared repetition penalty.",
+    )
+
+    parser.add_argument(
+        "--print-json",
+        action="store_true",
+        help="Print the final summary JSON to stdout.",
+    )
+
+    parser.add_argument(
+        "--skip-venv-sync",
+        action="store_true",
+        help="Reuse existing virtual environments without installing dependencies.",
+    )
+    parser.add_argument(
+        "--venv-reinstall",
+        action="store_true",
+        help="Remove and recreate virtual environments before running.",
+    )
+    parser.add_argument(
+        "--venv-upgrade",
+        action="store_true",
+        help="Upgrade dependencies to the latest allowed versions during sync.",
+    )
+
+    # HuggingFace options
     parser.add_argument(
         "--hf-model-id",
         default="meta-llama/Llama-3.1-8B",
@@ -85,32 +146,43 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Optional revision of the HuggingFace model.",
     )
     parser.add_argument(
+        "--hf-tokenizer-id",
+        default=None,
+        help="Optional tokenizer repository override for HuggingFace.",
+    )
+    parser.add_argument(
         "--hf-dtype",
         default="float32",
-        help="Torch dtype for HuggingFace backend.",
+        help="Torch dtype for HuggingFace.",
     )
     parser.add_argument(
         "--hf-num-threads",
         type=int,
         default=None,
-        help="Thread count override for HuggingFace backend.",
+        help="CPU thread override for HuggingFace.",
     )
     parser.add_argument(
         "--hf-warmup",
         action="store_true",
-        help="Enable warmup pass for HuggingFace backend.",
+        help="Enable warmup run for HuggingFace.",
+    )
+    parser.add_argument(
+        "--hf-warmup-tokens",
+        type=int,
+        default=32,
+        help="Warmup token count for HuggingFace.",
     )
 
-    # vLLM specific options
+    # vLLM options
     parser.add_argument(
         "--vllm-model-id",
         default="meta-llama/Llama-3.1-8B",
-        help="Model repository for vLLM backend.",
+        help="Model repository for vLLM.",
     )
     parser.add_argument(
         "--vllm-revision",
         default=None,
-        help="Optional revision of the vLLM model.",
+        help="Optional revision for the vLLM model.",
     )
     parser.add_argument(
         "--vllm-dtype",
@@ -121,30 +193,47 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--vllm-num-threads",
         type=int,
         default=None,
-        help="Thread count override for vLLM backend.",
+        help="CPU thread override for vLLM.",
     )
     parser.add_argument(
         "--vllm-warmup",
         action="store_true",
-        help="Enable warmup pass for vLLM backend.",
+        help="Enable warmup run for vLLM.",
+    )
+    parser.add_argument(
+        "--vllm-warmup-tokens",
+        type=int,
+        default=32,
+        help="Warmup token count for vLLM.",
+    )
+    parser.add_argument(
+        "--vllm-tensor-parallel-size",
+        type=int,
+        default=1,
+        help="Tensor parallel size for vLLM (CPU runs should use 1).",
+    )
+    parser.add_argument(
+        "--vllm-download-dir",
+        default=None,
+        help="Optional cache directory for vLLM model weights.",
     )
     parser.add_argument(
         "--vllm-enforce-eager",
         action="store_true",
-        help="Force eager execution mode in vLLM (recommended for CPU).",
+        help="Force eager execution in vLLM.",
     )
 
-    # llama.cpp specific options
+    # llama.cpp options
     parser.add_argument(
         "--llamacpp-model-path",
         default=None,
-        help="Path to the llama.cpp GGUF weights. Required when running the llama.cpp backend.",
+        help="Path to the llama.cpp GGUF model file.",
     )
     parser.add_argument(
         "--llamacpp-num-threads",
         type=int,
         default=None,
-        help="Thread count override for llama.cpp backend.",
+        help="CPU thread override for llama.cpp.",
     )
     parser.add_argument(
         "--llamacpp-n-ctx",
@@ -162,171 +251,188 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--llamacpp-seed",
         type=int,
         default=42,
-        help="Random seed for llama.cpp backend.",
+        help="Random seed for llama.cpp.",
     )
     parser.add_argument(
         "--llamacpp-warmup",
         action="store_true",
-        help="Enable warmup pass for llama.cpp backend.",
-    )
-
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-        help="Shared temperature parameter (applies to all backends unless overridden).",
+        help="Enable warmup run for llama.cpp.",
     )
     parser.add_argument(
-        "--top-p",
-        type=float,
-        default=1.0,
-        help="Shared top-p parameter.",
-    )
-    parser.add_argument(
-        "--repetition-penalty",
-        type=float,
-        default=1.0,
-        help="Shared repetition penalty parameter.",
-    )
-
-    parser.add_argument(
-        "--print-json",
-        action="store_true",
-        help="Print the combined JSON report to stdout.",
+        "--llamacpp-warmup-tokens",
+        type=int,
+        default=32,
+        help="Warmup token count for llama.cpp.",
     )
 
     return parser.parse_args(argv)
 
 
-def _normalize_backends(requested: Sequence[str]) -> List[str]:
-    normalized = []
-    for item in requested:
-        lower = item.lower()
-        if lower not in BACKEND_ALIASES:
-            raise ValueError(f"Unknown backend '{item}'. Valid options: hf, vllm, llamacpp.")
-        canonical = BACKEND_ALIASES[lower]
-        if canonical not in normalized:
-            normalized.append(canonical)
-    return normalized
+def _build_common_args(args: argparse.Namespace) -> List[str]:
+    cmd: List[str] = []
+    if args.prompt:
+        cmd.extend(["--prompt", args.prompt])
+    if args.prompt_file:
+        cmd.extend(["--prompt-file", str(args.prompt_file)])
+    cmd.extend(["--max-new-tokens", str(args.max_new_tokens)])
+    cmd.extend(["--temperature", str(args.temperature)])
+    cmd.extend(["--top-p", str(args.top_p)])
+    cmd.extend(["--repetition-penalty", str(args.repetition_penalty)])
+    return cmd
 
 
-def _load_prompt(prompt: Optional[str], prompt_file: Optional[str]) -> Optional[str]:
-    if prompt_file:
-        text = Path(prompt_file).read_text(encoding="utf-8")
-        return text.strip()
-    return prompt
+def _build_backend_command(
+    backend: str,
+    handle_python: Path,
+    args: argparse.Namespace,
+    output_path: Path,
+) -> List[str]:
+    script_dir = Path(__file__).resolve().parent
+    script_name = _BACKEND_SCRIPTS[backend]
+    script_path = script_dir / script_name
+
+    cmd: List[str] = [str(handle_python), str(script_path), "--output", str(output_path)]
+    cmd.extend(_build_common_args(args))
+
+    if backend == "huggingface":
+        cmd.extend(["--model-id", args.hf_model_id])
+        if args.hf_revision:
+            cmd.extend(["--revision", args.hf_revision])
+        if args.hf_tokenizer_id:
+            cmd.extend(["--tokenizer-id", args.hf_tokenizer_id])
+        cmd.extend(["--dtype", args.hf_dtype])
+        if args.hf_num_threads is not None:
+            cmd.extend(["--num-threads", str(args.hf_num_threads)])
+        if args.hf_warmup:
+            cmd.append("--warmup")
+        cmd.extend(["--warmup-tokens", str(args.hf_warmup_tokens)])
+    elif backend == "vllm":
+        cmd.extend(["--model-id", args.vllm_model_id])
+        if args.vllm_revision:
+            cmd.extend(["--revision", args.vllm_revision])
+        cmd.extend(["--dtype", args.vllm_dtype])
+        cmd.extend(["--tensor-parallel-size", str(args.vllm_tensor_parallel_size)])
+        if args.vllm_download_dir:
+            cmd.extend(["--download-dir", str(args.vllm_download_dir)])
+        if args.vllm_enforce_eager:
+            cmd.append("--enforce-eager")
+        if args.vllm_num_threads is not None:
+            cmd.extend(["--num-threads", str(args.vllm_num_threads)])
+        if args.vllm_warmup:
+            cmd.append("--warmup")
+        cmd.extend(["--warmup-tokens", str(args.vllm_warmup_tokens)])
+    elif backend == "llamacpp":
+        if not args.llamacpp_model_path:
+            raise VirtualEnvError(
+                "llama.cpp backend selected but --llamacpp-model-path was not provided."
+            )
+        cmd.extend(["--model-path", str(args.llamacpp_model_path)])
+        if args.llamacpp_num_threads is not None:
+            cmd.extend(["--num-threads", str(args.llamacpp_num_threads)])
+        cmd.extend(["--n-ctx", str(args.llamacpp_n_ctx)])
+        cmd.extend(["--n-batch", str(args.llamacpp_n_batch)])
+        cmd.extend(["--seed", str(args.llamacpp_seed)])
+        if args.llamacpp_warmup:
+            cmd.append("--warmup")
+        cmd.extend(["--warmup-tokens", str(args.llamacpp_warmup_tokens)])
+    else:
+        raise VirtualEnvError(f"Unsupported backend '{backend}'.")
+
+    return cmd
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    try:
-        backends = _normalize_backends(args.backends)
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+    backends = list(dict.fromkeys(_iter_backends(args.backends)))
+    if not backends:
+        print("No backends selected.", file=sys.stderr)
         return 1
 
-    prompt = _load_prompt(args.prompt, args.prompt_file)
-    default_prompt = HFBenchmarkConfig().prompt
-    resolved_prompt = prompt or default_prompt
-
-    results = []
-    errors: Dict[str, str] = {}
-
-    if "huggingface" in backends:
-        try:
-            hf_config = HFBenchmarkConfig(
-                model_id=args.hf_model_id,
-                revision=args.hf_revision,
-                dtype=args.hf_dtype,
-                prompt=resolved_prompt,
-                max_new_tokens=args.max_new_tokens,
-                num_threads=args.hf_num_threads,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                repetition_penalty=args.repetition_penalty,
-                do_warmup=args.hf_warmup,
-            )
-            results.append(run_hf_benchmark(hf_config))
-        except Exception as exc:  # pylint: disable=broad-except
-            errors["huggingface"] = "".join(
-                traceback.format_exception_only(exc.__class__, exc)
-            ).strip()
-
-    if "vllm" in backends:
-        try:
-            vllm_config = VLLMBenchmarkConfig(
-                model_id=args.vllm_model_id,
-                revision=args.vllm_revision,
-                dtype=args.vllm_dtype,
-                prompt=resolved_prompt,
-                max_new_tokens=args.max_new_tokens,
-                num_threads=args.vllm_num_threads,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                repetition_penalty=args.repetition_penalty,
-                do_warmup=args.vllm_warmup,
-                enforce_eager=args.vllm_enforce_eager,
-            )
-            results.append(run_vllm_benchmark(vllm_config))
-        except Exception as exc:  # pylint: disable=broad-except
-            errors["vllm"] = "".join(
-                traceback.format_exception_only(exc.__class__, exc)
-            ).strip()
-
-    if "llama.cpp" in backends:
-        model_path = args.llamacpp_model_path
-        if not model_path:
-            errors["llama.cpp"] = "Missing --llamacpp-model-path argument."
-        else:
-            path = Path(model_path)
-            if not path.exists():
-                errors["llama.cpp"] = f"GGUF model not found at {path}"
-            else:
-                try:
-                    llamacpp_config = LlamaCppBenchmarkConfig(
-                        model_path=str(path),
-                        prompt=resolved_prompt,
-                        max_new_tokens=args.max_new_tokens,
-                        num_threads=args.llamacpp_num_threads,
-                        n_ctx=args.llamacpp_n_ctx,
-                        n_batch=args.llamacpp_n_batch,
-                        seed=args.llamacpp_seed,
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        repetition_penalty=args.repetition_penalty,
-                        do_warmup=args.llamacpp_warmup,
-                    )
-                    results.append(run_llamacpp_benchmark(llamacpp_config))
-                except Exception as exc:  # pylint: disable=broad-except
-                    errors["llama.cpp"] = "".join(
-                        traceback.format_exception_only(exc.__class__, exc)
-                    ).strip()
-
-    if results:
-        print(format_results_table(results))
-    else:
-        print("No successful benchmark results to display.", file=sys.stderr)
-
-    if errors:
-        print("\nErrors:", file=sys.stderr)
-        for backend, message in errors.items():
-            print(f"- {backend}: {message}", file=sys.stderr)
-
-    payload = aggregate_results(results)
-    if errors:
-        payload["errors"] = errors
-
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    suffix = f"_{args.label}" if args.label else ""
-    output_path = args.output_dir / f"benchmark_{timestamp}{suffix}.json"
-    write_results(payload, output_path)
-    print(f"\nSaved combined results to {output_path}")
+    label_suffix = f"_{args.label}" if args.label else ""
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_rows: List[List[str]] = []
+    combined_results: List[Dict[str, object]] = []
+    backend_payloads: Dict[str, Dict[str, object]] = {}
+
+    for backend in backends:
+        print(f"\n=== Running backend: {backend} ===")
+        try:
+            handle = ensure_virtualenv(
+                backend,
+                sync_dependencies=not args.skip_venv_sync,
+                reinstall=args.venv_reinstall,
+                upgrade=args.venv_upgrade,
+            )
+        except VirtualEnvError as exc:
+            print(f"Failed to prepare virtualenv for {backend}: {exc}", file=sys.stderr)
+            return 2
+
+        backend_dir = args.output_dir / backend
+        backend_dir.mkdir(parents=True, exist_ok=True)
+        output_path = backend_dir / f"{timestamp}{label_suffix}.json"
+
+        cmd = _build_backend_command(backend, handle.python, args, output_path)
+        print(f"Executing: {' '.join(cmd)}")
+        try:
+            subprocess.run(cmd, check=True, cwd=Path(__file__).resolve().parent.parent)
+        except subprocess.CalledProcessError as exc:
+            print(f"Backend '{backend}' failed with exit code {exc.returncode}.", file=sys.stderr)
+            return exc.returncode or 3
+
+        if not output_path.exists():
+            print(f"Expected output file {output_path} was not created.", file=sys.stderr)
+            return 4
+
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        backend_payloads[backend] = payload
+        for result in payload.get("results", []):
+            combined_results.append(result)
+            summary_rows.append(
+                [
+                    backend,
+                    str(result.get("model", "")),
+                    str(result.get("num_threads") or "-"),
+                    f"{float(result.get('load_time_s', 0.0)):.2f}",
+                    f"{float(result.get('generate_time_s', 0.0)):.2f}",
+                    str(result.get("completion_tokens", "")),
+                    f"{float(result.get('tokens_per_second', 0.0)):.2f}",
+                    f"{float(result.get('peak_memory_bytes', 0.0)) / (1024 ** 2):.1f}",
+                ]
+            )
+
+    if combined_results:
+        headers = [
+            "Backend",
+            "Model",
+            "Threads",
+            "Load (s)",
+            "Gen (s)",
+            "Tokens",
+            "Tok/s",
+            "Peak Mem (MiB)",
+        ]
+        print("\n=== Summary ===")
+        print(_format_table(headers, summary_rows))
+
+    summary_payload = {
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "label": args.label,
+        "results": combined_results,
+        "per_backend": backend_payloads,
+    }
+
+    summary_path = args.output_dir / f"summary_{timestamp}{label_suffix}.json"
+    summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
+    print(f"\nSaved combined results to {summary_path}")
 
     if args.print_json:
-        print(json.dumps(payload, indent=2))
+        print(json.dumps(summary_payload, indent=2))
 
-    return 0 if results else 2
+    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())

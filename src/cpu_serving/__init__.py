@@ -12,6 +12,11 @@ from .benchmarks import (
     run_llamacpp_benchmark,
     aggregate_results,
 )
+from .venv_manager import (
+    VirtualEnvError,
+    available_backends,
+    ensure_virtualenv,
+)
 
 __all__ = [
     "HFBenchmarkConfig",
@@ -22,4 +27,7 @@ __all__ = [
     "run_vllm_benchmark",
     "run_llamacpp_benchmark",
     "aggregate_results",
+    "available_backends",
+    "ensure_virtualenv",
+    "VirtualEnvError",
 ]

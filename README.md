@@ -15,11 +15,16 @@ The repository provides a ready-to-use devcontainer, standalone backend scripts,
   ```bash
   devcontainer open .
   ```
-  The container installs Python 3.11, CPU-only PyTorch, vLLM, llama.cpp bindings, and supporting tools via `requirements.txt`.
+  The container now uses Ubuntu 24.04 with Python 3.12, the `uv` package manager, and tooling required to build CPU-first inference stacks.
 - Authenticate with Hugging Face inside the container so downloads succeed:
   ```bash
   huggingface-cli login
   ```
+- Provision the per-backend virtual environments (re-run whenever dependencies need refreshing):
+  ```bash
+  python scripts/setup_virtualenvs.py
+  ```
+  The command prints the interpreter path for each backend. By default environments live in `/opt/venvs` inside the devcontainer (or `.venvs/` when running locally).
 
 ## Model Assets
 
@@ -28,34 +33,34 @@ The repository provides a ready-to-use devcontainer, standalone backend scripts,
 
 ## Single Backend Benchmarks
 
-Each script reports peak resident memory, load time, generation latency, and tokens-per-second. Use `--help` on any script for options.
+Each backend owns an isolated virtual environment to avoid conflicts between PyTorch and vLLM builds. Use `scripts/setup_virtualenvs.py` to discover interpreter paths, then call the desired script with that interpreter (all scripts accept `--help` for full options):
 
 - PyTorch / Transformers:
   ```bash
-  python scripts/benchmark_hf.py \
+  /opt/venvs/venv-hf/bin/python scripts/benchmark_hf.py \
     --model-id meta-llama/Llama-3.1-8B \
     --max-new-tokens 128 \
     --num-threads 16
   ```
 - vLLM (CPU eager mode recommended):
   ```bash
-  python scripts/benchmark_vllm.py \
+  /opt/venvs/venv-vllm/bin/python scripts/benchmark_vllm.py \
     --model-id meta-llama/Llama-3.1-8B \
     --enforce-eager \
     --num-threads 16
   ```
 - llama.cpp (GGUF input required):
   ```bash
-  python scripts/benchmark_llamacpp.py \
+  /opt/venvs/venv-llamacpp/bin/python scripts/benchmark_llamacpp.py \
     --model-path ./models/llama-3.1-8b-q4_k_m.gguf \
     --num-threads 16
   ```
 
-All scripts accept `--prompt` or `--prompt-file` for custom inputs and can emit raw JSON via `--print-json`.
+Adjust the interpreter prefix if you are running outside the devcontainer (check the `setup_virtualenvs.py` output). All scripts accept `--prompt` or `--prompt-file` for custom inputs and can emit raw JSON via `--print-json`.
 
 ## Full Comparative Run
 
-`python scripts/run_all_benchmarks.py` orchestrates every backend, collates results, and saves a timestamped report under `artifacts/`.
+`python scripts/run_all_benchmarks.py` prepares the required virtual environments on demand, orchestrates every backend, and saves timestamped reports under `artifacts/`.
 
 Example:
 ```bash
@@ -68,7 +73,7 @@ python scripts/run_all_benchmarks.py \
   --label local-test
 ```
 
-Use `--backends` to run a subset (e.g. `--backends hf vllm`) and `--print-json` to mirror the saved payload to stdout. Any backend failures are captured in the JSON under `errors`.
+Use `--backends` to run a subset (e.g. `--backends hf vllm`). The runner reuses existing environments by default; add `--venv-reinstall` to recreate them or `--skip-venv-sync` to rely on previously installed dependencies. Include `--print-json` to mirror the final summary to stdout.
 
 ## Results
 
@@ -82,9 +87,10 @@ Saved files follow `artifacts/benchmark_<timestamp>[_label].json`. They can be p
 ## Repository Layout
 
 - `.devcontainer/` – devcontainer configuration, Dockerfile, and post-create installer.
-- `requirements.txt` – Python dependencies (CPU-only PyTorch, vLLM, llama-cpp-python, etc.).
-- `scripts/` – entry points for individual backends and the orchestration runner.
-- `src/cpu_serving/` – reusable benchmarking utilities (memory sampling, result formatting).
+- `envs/` – dependency declarations for each virtual environment.
+- `requirements.txt` – pointer to the per-backend dependency files.
+- `scripts/` – entry points for individual backends, virtualenv bootstrapper, and the orchestration runner.
+- `src/cpu_serving/` – reusable benchmarking utilities (memory sampling, result formatting, virtualenv helpers).
 - `artifacts/` – output directory for JSON reports (kept empty via `.gitkeep`).
 
 ## Notes & Tips
@@ -92,3 +98,4 @@ Saved files follow `artifacts/benchmark_<timestamp>[_label].json`. They can be p
 - Large CPU runs benefit from setting `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, and `VLLM_WORKER_CPU_THREADS`; the scripts set these automatically when `--num-threads` is provided.
 - vLLM CPU support is evolving; enabling `--enforce-eager` often yields more predictable behavior at the expense of throughput.
 - Peak memory estimates rely on periodic RSS sampling through `psutil`; adjust the sampling rate in `src/cpu_serving/benchmarks.py` if more precision is required.
+- The default interpreter candidates favour Python 3.12 for Transformers and python3.13 for vLLM when available, matching the latest supported PyTorch wheels. Override the interpreter by exporting `VIRTUALENV_HOME` and ensuring the desired binary is on `PATH`.
