@@ -1,22 +1,23 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import platform
+import subprocess
 import threading
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
+import tempfile
 from typing import Any, Dict, Iterable, List, Optional
+from uuid import uuid4
 
 import psutil
 
 
-DEFAULT_PROMPT = (
-    "Provide a concise technical summary of the Llama 3.1 8B model that focuses on "
-    "CPU-only inference considerations, including memory footprint and expected latency."
-)
+DEFAULT_PROMPT = "Quick CPU smoke-test prompt for the Hugging Face backend."
 
 
 def _normalize_dtype(dtype: str) -> str:
@@ -102,8 +103,8 @@ class BenchmarkResult:
 @dataclass
 class BaseBenchmarkConfig:
     prompt: str = DEFAULT_PROMPT
-    max_new_tokens: int = 128
-    num_threads: Optional[int] = None
+    max_new_tokens: int = 8
+    num_threads: Optional[int] = 2
     temperature: float = 0.0
     top_p: float = 1.0
     repetition_penalty: float = 1.0
@@ -113,7 +114,7 @@ class BaseBenchmarkConfig:
 
 @dataclass
 class HFBenchmarkConfig(BaseBenchmarkConfig):
-    model_id: str = "meta-llama/Llama-3.1-8B"
+    model_id: str = "meta-llama/Llama-3.2-1B"
     revision: Optional[str] = None
     dtype: str = "float32"
     trust_remote_code: bool = False
@@ -122,7 +123,7 @@ class HFBenchmarkConfig(BaseBenchmarkConfig):
 
 @dataclass
 class VLLMBenchmarkConfig(BaseBenchmarkConfig):
-    model_id: str = "meta-llama/Llama-3.1-8B"
+    model_id: str = "meta-llama/Llama-3.2-1B"
     revision: Optional[str] = None
     dtype: str = "float32"
     tensor_parallel_size: int = 1
@@ -132,10 +133,63 @@ class VLLMBenchmarkConfig(BaseBenchmarkConfig):
 
 @dataclass
 class LlamaCppBenchmarkConfig(BaseBenchmarkConfig):
-    model_path: str = "./models/llama-3.1-8b-q4_k_m.gguf"
+    model_path: str = (
+        "./models/hugging-quants--Llama-3.2-1B-Instruct-Q4_K_M-GGUF/"
+        "llama-3.2-1b-instruct-q4_k_m.gguf"
+    )
     n_ctx: int = 4096
     n_batch: int = 512
     seed: int = 42
+
+
+_VLLM_IPC_PATCHED = False
+
+
+def _ensure_vllm_ipc_support() -> None:
+    """Force vLLM to fall back to TCP sockets if IPC is not permitted."""
+
+    global _VLLM_IPC_PATCHED
+    if _VLLM_IPC_PATCHED:
+        return
+
+    try:
+        import zmq  # type: ignore
+        from vllm import utils as vllm_utils  # type: ignore
+    except ImportError:
+        return
+
+    ctx = zmq.Context()  # type: ignore[attr-defined]
+    socket_path = Path(tempfile.gettempdir()) / f"cpu-serving-zmq-{uuid4().hex}"
+    ipc_uri = f"ipc://{socket_path}"
+    original_get_ipc = getattr(vllm_utils, "get_open_zmq_ipc_path", None)
+    sock = ctx.socket(zmq.ROUTER)  # type: ignore[attr-defined]
+    try:
+        sock.bind(ipc_uri)
+    except zmq.ZMQError as exc:  # type: ignore[attr-defined]
+        if exc.errno not in {getattr(zmq, "EPERM", errno.EPERM), errno.EPERM}:
+            return
+
+        def _tcp_uri() -> str:
+            try:
+                port = vllm_utils.get_open_port()
+                return f"tcp://127.0.0.1:{port}"
+            except OSError:
+                if callable(original_get_ipc):
+                    return original_get_ipc()
+                return ipc_uri
+
+        vllm_utils.get_open_zmq_ipc_path = _tcp_uri  # type: ignore[assignment]
+        _VLLM_IPC_PATCHED = True
+    finally:
+        try:
+            sock.close(0)
+        except Exception:
+            pass
+        ctx.term()
+        try:
+            socket_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _ensure_threads_config(num_threads: Optional[int]) -> None:
@@ -249,11 +303,94 @@ def run_hf_benchmark(config: HFBenchmarkConfig) -> BenchmarkResult:
     )
 
 
+_VLLM_CPU_PATCHED = False
+
+
 def run_vllm_benchmark(config: VLLMBenchmarkConfig) -> BenchmarkResult:
     from vllm import LLM, SamplingParams
+    from vllm import platforms as vllm_platforms
+    try:
+        from vllm.platforms.cpu import CpuPlatform, LogicalCPUInfo  # type: ignore
+    except ImportError as exc:  # pragma: no cover - defensive guard
+        raise RuntimeError(
+            "vLLM CPU platform is unavailable; install a CPU-enabled build."
+        ) from exc
 
     _ensure_threads_config(config.num_threads)
     dtype = _normalize_dtype(config.dtype)
+
+    current_platform = vllm_platforms.current_platform
+    if not current_platform.is_cpu():
+        current_platform.__class__ = CpuPlatform
+        current_platform.device_type = "cpu"
+        current_platform.device_name = "cpu"
+        current_platform.dispatch_key = "CPU"
+        current_platform.dist_backend = "gloo"
+        current_platform._enum = CpuPlatform._enum
+
+    global _VLLM_CPU_PATCHED
+    if not _VLLM_CPU_PATCHED:
+        original_method = CpuPlatform.get_allowed_cpu_core_node_list
+
+        def _patched_get_allowed_cpu_core_node_list(cls):  # type: ignore[override]
+            try:
+                return original_method.__func__(cls)  # type: ignore[attr-defined]
+            except (
+                json.JSONDecodeError,
+                FileNotFoundError,
+                subprocess.CalledProcessError,
+            ):
+                try:
+                    lscpu_output = subprocess.check_output(
+                        "lscpu -J -e=CPU,CORE,NODE", shell=True, text=True
+                    )
+                except Exception:
+                    return original_method.__func__(cls)  # type: ignore[attr-defined]
+
+                sanitized = lscpu_output.replace('"node": -', '"node": 0')
+                decoded = json.loads(
+                    sanitized, object_hook=LogicalCPUInfo.json_decoder
+                )
+                logical_cpu_list: List[LogicalCPUInfo] = decoded.get("cpus", [])
+
+                allowed_cpu_ids = sorted(os.sched_getaffinity(0))
+                logical_cpu_list = [
+                    cpu for cpu in logical_cpu_list if cpu.id in allowed_cpu_ids
+                ]
+
+                if not logical_cpu_list:
+                    logical_cpu_list = [
+                        LogicalCPUInfo(
+                            id=cpu_id,
+                            physical_core=cpu_id,
+                            numa_node=0,
+                        )
+                        for cpu_id in allowed_cpu_ids
+                    ]
+
+                for cpu in logical_cpu_list:
+                    if getattr(cpu, "numa_node", 0) < 0:
+                        cpu.numa_node = 0  # type: ignore[attr-defined]
+
+                allowed_numa_nodes = sorted({cpu.numa_node for cpu in logical_cpu_list}) or [0]
+
+                env_key = CpuPlatform.device_control_env_var
+                if env_key in os.environ and os.environ[env_key]:
+                    visible_nodes = [
+                        int(s) for s in os.environ[env_key].split(",") if s.strip()
+                    ]
+                    filtered = [node for node in allowed_numa_nodes if node in visible_nodes]
+                    if filtered:
+                        allowed_numa_nodes = filtered
+
+                return allowed_numa_nodes, logical_cpu_list
+
+        CpuPlatform.get_allowed_cpu_core_node_list = classmethod(
+            _patched_get_allowed_cpu_core_node_list
+        )
+        _VLLM_CPU_PATCHED = True
+
+    _ensure_vllm_ipc_support()
 
     load_start = time.perf_counter()
     llm = LLM(
@@ -263,7 +400,6 @@ def run_vllm_benchmark(config: VLLMBenchmarkConfig) -> BenchmarkResult:
         dtype=dtype,
         trust_remote_code=True,
         tensor_parallel_size=config.tensor_parallel_size,
-        device="cpu",
         enforce_eager=config.enforce_eager,
     )
     load_time = time.perf_counter() - load_start

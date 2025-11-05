@@ -139,6 +139,8 @@ def _install_requirements(python_bin: Path, requirements: Path, *, upgrade: bool
         str(python_bin),
         "--requirement",
         str(requirements),
+        "--index-strategy",
+        "unsafe-best-match",
     ]
     if upgrade:
         cmd.append("--upgrade")

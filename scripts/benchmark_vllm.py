@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Benchmark vLLM CPU execution for Llama 3.1 8B."""
+"""Benchmark vLLM CPU execution for Llama 3.2 1B."""
 
 from __future__ import annotations
 
@@ -21,9 +21,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="CPU benchmark for the vLLM inference backend."
     )
+    defaults = VLLMBenchmarkConfig()
     parser.add_argument(
         "--model-id",
-        default="meta-llama/Llama-3.1-8B",
+        default=defaults.model_id,
         help="HuggingFace model repository to evaluate.",
     )
     parser.add_argument(
@@ -39,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tensor-parallel-size",
         type=int,
-        default=1,
+        default=defaults.tensor_parallel_size,
         help="Tensor parallelism degree. For CPU runs, keep this at 1.",
     )
     parser.add_argument(
@@ -54,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--prompt",
-        default=None,
+        default=defaults.prompt,
         help="Prompt string to feed the model.",
     )
     parser.add_argument(
@@ -65,13 +66,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=128,
+        default=defaults.max_new_tokens,
         help="Maximum number of completion tokens.",
     )
     parser.add_argument(
         "--num-threads",
         type=int,
-        default=None,
+        default=defaults.num_threads,
         help="Override the number of CPU threads vLLM should use.",
     )
     parser.add_argument(

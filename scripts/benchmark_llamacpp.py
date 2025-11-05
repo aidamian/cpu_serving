@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Benchmark llama.cpp CPU execution for Llama 3.1 8B GGUF weights."""
+"""Benchmark llama.cpp CPU execution for Llama 3.2 1B GGUF weights."""
 
 from __future__ import annotations
 
@@ -21,14 +21,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="CPU benchmark for llama.cpp GGUF weights."
     )
+    defaults = LlamaCppBenchmarkConfig()
     parser.add_argument(
         "--model-path",
-        required=True,
-        help="Path to the GGUF model file (e.g. Llama 3.1 8B quantized weights).",
+        default=defaults.model_path,
+        help="Path to the GGUF model file (e.g. Llama 3.2 1B quantized weights).",
     )
     parser.add_argument(
         "--prompt",
-        default=None,
+        default=defaults.prompt,
         help="Prompt string for the benchmark run.",
     )
     parser.add_argument(
@@ -39,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=128,
+        default=defaults.max_new_tokens,
         help="Maximum number of tokens to generate.",
     )
     parser.add_argument(
@@ -57,8 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--num-threads",
         type=int,
-        default=None,
-        help="Override number of CPU threads. Defaults to all logical cores.",
+        default=defaults.num_threads,
+        help="Override number of CPU threads. Defaults to 2.",
     )
     parser.add_argument(
         "--seed",

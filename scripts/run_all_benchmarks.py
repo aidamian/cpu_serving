@@ -18,6 +18,15 @@ from cpu_serving.venv_manager import (
     resolve_backend,
 )
 
+_DEFAULT_PROMPT = "Quick CPU smoke-test prompt for the Hugging Face backend."
+_DEFAULT_MAX_NEW_TOKENS = 8
+_DEFAULT_NUM_THREADS = 2
+_DEFAULT_MODEL_ID = "meta-llama/Llama-3.2-1B"
+_DEFAULT_LLAMACPP_MODEL = (
+    "./models/hugging-quants--Llama-3.2-1B-Instruct-Q4_K_M-GGUF/"
+    "llama-3.2-1b-instruct-q4_k_m.gguf"
+)
+
 
 _BACKEND_SCRIPTS: Dict[str, str] = {
     "huggingface": "benchmark_hf.py",
@@ -61,7 +70,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--prompt",
-        default=None,
+        default=_DEFAULT_PROMPT,
         help="Prompt string to reuse for every backend.",
     )
     parser.add_argument(
@@ -72,7 +81,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=128,
+        default=_DEFAULT_MAX_NEW_TOKENS,
         help="Maximum completion tokens for each backend.",
     )
     parser.add_argument(
@@ -84,12 +93,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("artifacts"),
+        default=Path("artifacts/simple_test"),
         help="Directory to store per-backend and summary JSON outputs.",
     )
     parser.add_argument(
         "--label",
-        default=None,
+        default="simple-test",
         help="Optional label to embed in output filenames.",
     )
 
@@ -117,6 +126,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Print the final summary JSON to stdout.",
     )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Do not abort on backend failures; continue running remaining backends.",
+    )
 
     parser.add_argument(
         "--skip-venv-sync",
@@ -137,7 +151,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     # HuggingFace options
     parser.add_argument(
         "--hf-model-id",
-        default="meta-llama/Llama-3.1-8B",
+        default=_DEFAULT_MODEL_ID,
         help="Model repository for the HuggingFace backend.",
     )
     parser.add_argument(
@@ -158,7 +172,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--hf-num-threads",
         type=int,
-        default=None,
+        default=_DEFAULT_NUM_THREADS,
         help="CPU thread override for HuggingFace.",
     )
     parser.add_argument(
@@ -176,7 +190,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     # vLLM options
     parser.add_argument(
         "--vllm-model-id",
-        default="meta-llama/Llama-3.1-8B",
+        default=_DEFAULT_MODEL_ID,
         help="Model repository for vLLM.",
     )
     parser.add_argument(
@@ -192,7 +206,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--vllm-num-threads",
         type=int,
-        default=None,
+        default=_DEFAULT_NUM_THREADS,
         help="CPU thread override for vLLM.",
     )
     parser.add_argument(
@@ -226,13 +240,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     # llama.cpp options
     parser.add_argument(
         "--llamacpp-model-path",
-        default=None,
+        default=_DEFAULT_LLAMACPP_MODEL,
         help="Path to the llama.cpp GGUF model file.",
     )
     parser.add_argument(
         "--llamacpp-num-threads",
         type=int,
-        default=None,
+        default=_DEFAULT_NUM_THREADS,
         help="CPU thread override for llama.cpp.",
     )
     parser.add_argument(
@@ -356,6 +370,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     summary_rows: List[List[str]] = []
     combined_results: List[Dict[str, object]] = []
     backend_payloads: Dict[str, Dict[str, object]] = {}
+    failures: List[Dict[str, object]] = []
 
     for backend in backends:
         print(f"\n=== Running backend: {backend} ===")
@@ -379,11 +394,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             subprocess.run(cmd, check=True, cwd=Path(__file__).resolve().parent.parent)
         except subprocess.CalledProcessError as exc:
-            print(f"Backend '{backend}' failed with exit code {exc.returncode}.", file=sys.stderr)
+            message = f"Backend '{backend}' failed with exit code {exc.returncode}."
+            print(message, file=sys.stderr)
+            if args.continue_on_error:
+                failures.append(
+                    {
+                        "backend": backend,
+                        "return_code": exc.returncode,
+                        "command": cmd,
+                    }
+                )
+                continue
             return exc.returncode or 3
 
         if not output_path.exists():
             print(f"Expected output file {output_path} was not created.", file=sys.stderr)
+            if args.continue_on_error:
+                failures.append(
+                    {
+                        "backend": backend,
+                        "return_code": 4,
+                        "command": cmd,
+                        "error": "missing_output",
+                    }
+                )
+                continue
             return 4
 
         payload = json.loads(output_path.read_text(encoding="utf-8"))
@@ -422,6 +457,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "label": args.label,
         "results": combined_results,
         "per_backend": backend_payloads,
+        "failures": failures,
     }
 
     summary_path = args.output_dir / f"summary_{timestamp}{label_suffix}.json"
@@ -431,6 +467,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.print_json:
         print(json.dumps(summary_payload, indent=2))
 
+    if failures:
+        print(
+            f"{len(failures)} backend(s) failed; see summary for details.",
+            file=sys.stderr,
+        )
+    if failures and not args.continue_on_error:
+        first = failures[0]
+        return int(first.get("return_code") or 3)
     return 0
 
 
