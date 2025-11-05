@@ -15,6 +15,7 @@ from cpu_serving.benchmarks import (
     run_llamacpp_benchmark,
     write_results,
 )
+from cpu_serving.console import log_color
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -140,18 +141,19 @@ def main() -> None:
     )
 
     result = run_llamacpp_benchmark(config)
-    print(format_results_table([result]))
-    print()
-    print("Completion preview:")
-    print(result.completion)
+    log_color(format_results_table([result]), "b")
+    print("", flush=True)
+    log_color("Completion preview:", "y")
+    log_color(result.completion, "g")
 
     payload = aggregate_results([result])
     if args.output:
         write_results(payload, args.output)
-        print(f"\nSaved results to {args.output}")
+        print("", flush=True)
+        log_color(f"Saved results to {args.output}", "g")
 
     if args.print_json:
-        print(json.dumps(payload, indent=2))
+        log_color(json.dumps(payload, indent=2), "d")
 
 
 if __name__ == "__main__":

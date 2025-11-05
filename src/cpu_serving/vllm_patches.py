@@ -16,6 +16,8 @@ _IPC_PATCHED = False
 _TORCH_THREADS_PATCHED = False
 _CPU_PLATFORM_PATCHED = False
 _CACHE_ROOT_PATCHED = False
+_RMS_NORM_PATCHED = False
+_ROPE_PATCHED = False
 
 
 def patch_cpu_topology() -> bool:
@@ -190,6 +192,95 @@ def ensure_torch_thread_binding_stub() -> bool:
     return True
 
 
+def ensure_rms_norm_fallback() -> bool:
+    """Fallback implementation when custom RMSNorm kernel is unavailable."""
+
+    global _RMS_NORM_PATCHED
+    if _RMS_NORM_PATCHED:
+        return False
+
+    try:
+        import torch
+        from vllm.model_executor.layers import layernorm as ln  # type: ignore
+    except ImportError:
+        return False
+
+    has_custom = hasattr(getattr(torch.ops, "_C", None), "rms_norm")
+    if has_custom:
+        _RMS_NORM_PATCHED = True
+        return False
+
+    def _fallback_rms_norm(x: torch.Tensor, weight: torch.Tensor,
+                           variance_epsilon: float) -> torch.Tensor:
+        eps = torch.tensor(variance_epsilon, dtype=x.dtype, device=x.device)
+        mean_square = x.pow(2).mean(dim=-1, keepdim=True)
+        scale = torch.rsqrt(mean_square + eps)
+        return x * scale * weight
+
+    ln.rms_norm = _fallback_rms_norm  # type: ignore[assignment]
+    _RMS_NORM_PATCHED = True
+    return True
+
+
+def ensure_rotary_embedding_fallback() -> bool:
+    """Provide a pure Torch rotary embedding when custom op is missing."""
+
+    global _ROPE_PATCHED
+    if _ROPE_PATCHED:
+        return False
+
+    try:
+        import torch
+        from vllm.model_executor.layers.rotary_embedding import base as rope_base  # type: ignore
+    except ImportError:
+        return False
+
+    has_custom = hasattr(getattr(torch.ops, "_C", None), "rotary_embedding")
+    if has_custom:
+        _ROPE_PATCHED = True
+        return False
+
+    def _fallback_rotary_embedding(
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        head_size: int,
+        base: float,
+        scale: float,
+        type_id: int,
+        rotary_dim: int,
+        interleaved: bool,
+    ) -> None:
+        # Inspired by traditional RoPE; applies in-place rotations.
+        dtype = query.dtype
+        device = query.device
+        theta = base ** (-2 * torch.arange(0, rotary_dim, 2, device=device, dtype=dtype) / rotary_dim)
+        seq_position = positions.to(dtype=dtype).unsqueeze(-1)
+        freqs = seq_position * theta
+        cos = torch.cos(freqs)
+        sin = torch.sin(freqs)
+        cos = cos.unsqueeze(-2)
+        sin = sin.unsqueeze(-2)
+
+        def _apply(x: torch.Tensor) -> torch.Tensor:
+            x1 = x[..., :rotary_dim]
+            x2 = x[..., rotary_dim:]
+            x1_reshaped = x1.reshape(*x1.shape[:-1], rotary_dim // 2, 2)
+            x1_first = x1_reshaped[..., 0]
+            x1_second = x1_reshaped[..., 1]
+            rotated_first = x1_first * cos - x1_second * sin
+            rotated_second = x1_second * cos + x1_first * sin
+            rotated = torch.stack((rotated_first, rotated_second), dim=-1).reshape_as(x1)
+            return torch.cat((rotated, x2), dim=-1)
+
+        query.copy_(_apply(query))
+        key.copy_(_apply(key))
+
+    rope_base.rotary_embedding = _fallback_rotary_embedding  # type: ignore[assignment]
+    _ROPE_PATCHED = True
+    return True
+
+
 def ensure_cpu_platform() -> bool:
     """Ensure the global platform object behaves like the CPU backend."""
 
@@ -245,7 +336,7 @@ def ensure_vllm_cache_root() -> bool:
     return True
 
 
-def apply_all() -> Tuple[bool, bool, bool, bool, bool]:
+def apply_all() -> Tuple[bool, bool, bool, bool, bool, bool, bool]:
     """Apply every available vLLM patch."""
 
     return (
@@ -254,4 +345,6 @@ def apply_all() -> Tuple[bool, bool, bool, bool, bool]:
         patch_cpu_topology(),
         ensure_vllm_ipc_support(),
         ensure_torch_thread_binding_stub(),
+        ensure_rms_norm_fallback(),
+        ensure_rotary_embedding_fallback(),
     )

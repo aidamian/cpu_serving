@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field, asdict
@@ -11,7 +12,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-import psutil
+try:
+    import psutil  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    psutil = None  # type: ignore
+
+try:
+    import resource  # type: ignore
+except ImportError:  # pragma: no cover - non-POSIX platforms
+    resource = None  # type: ignore
 
 from cpu_serving.vllm_patches import (
     ensure_cpu_platform,
@@ -21,7 +30,75 @@ from cpu_serving.vllm_patches import (
 )
 
 
-DEFAULT_PROMPT = "Quick CPU smoke-test prompt for the Hugging Face backend."
+DEFAULT_PROMPT = (
+    "Write the DDL SQL for the definition of user accounts table. "
+    "Output only the viable SQL."
+)
+
+
+def short_model_name(model: str | os.PathLike[str]) -> str:
+    text = str(model).rstrip("/\\")
+    if not text:
+        return str(model)
+    normalized = text.replace("\\", "/")
+    short = normalized.split("/")[-1]
+    return short or normalized
+
+
+def _read_rss_bytes(process: Any | None = None) -> int:
+    if psutil is not None:
+        try:
+            proc = process or psutil.Process(os.getpid())
+            return int(proc.memory_info().rss)
+        except Exception:
+            return 0
+    if resource is not None:
+        try:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            rss = getattr(usage, "ru_maxrss", 0)
+            if rss == 0:
+                return 0
+            if sys.platform.startswith("darwin"):
+                return int(rss)
+            return int(rss * 1024)
+        except Exception:
+            return 0
+    return 0
+
+
+def _logical_cpu_count() -> Optional[int]:
+    if psutil is not None:
+        try:
+            return psutil.cpu_count(logical=True)
+        except Exception:
+            return None
+    return os.cpu_count()
+
+
+def _physical_cpu_count() -> Optional[int]:
+    if psutil is not None:
+        try:
+            return psutil.cpu_count(logical=False)
+        except Exception:
+            return None
+    return None
+
+
+def _total_memory_bytes() -> Optional[int]:
+    if psutil is not None:
+        try:
+            return int(psutil.virtual_memory().total)
+        except Exception:
+            return None
+    if hasattr(os, "sysconf"):
+        try:
+            pages = os.sysconf("SC_PHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            if isinstance(pages, int) and isinstance(page_size, int) and pages > 0 and page_size > 0:
+                return pages * page_size
+        except (ValueError, OSError, AttributeError):
+            pass
+    return None
 
 
 def _normalize_dtype(dtype: str) -> str:
@@ -40,13 +117,13 @@ class MemoryMonitor:
 
     def __init__(self, interval_s: float = 0.05) -> None:
         self.interval_s = interval_s
-        self._process = psutil.Process(os.getpid())
+        self._process = psutil.Process(os.getpid()) if psutil is not None else None
         self.max_rss_bytes = 0
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
     def __enter__(self) -> "MemoryMonitor":
-        self.max_rss_bytes = self._process.memory_info().rss
+        self.max_rss_bytes = _read_rss_bytes(self._process)
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -61,11 +138,11 @@ class MemoryMonitor:
     def _run(self) -> None:
         while not self._stop_event.is_set():
             try:
-                rss = self._process.memory_info().rss
+                rss = _read_rss_bytes(self._process)
                 if rss > self.max_rss_bytes:
                     self.max_rss_bytes = rss
-            except psutil.Error:
-                # Process might have ended; bail out.
+            except Exception:
+                # Process might have ended or platform lacks metrics; bail out quietly.
                 break
             time.sleep(self.interval_s)
 
@@ -107,7 +184,7 @@ class BenchmarkResult:
 @dataclass
 class BaseBenchmarkConfig:
     prompt: str = DEFAULT_PROMPT
-    max_new_tokens: int = 8
+    max_new_tokens: int = 250
     num_threads: Optional[int] = 2
     temperature: float = 0.0
     top_p: float = 1.0
@@ -426,9 +503,9 @@ def aggregate_results(results: Iterable[BenchmarkResult]) -> Dict[str, Any]:
             "cpu": platform.processor(),
             "machine": platform.machine(),
             "python": platform.python_version(),
-            "logical_cores": psutil.cpu_count(logical=True),
-            "physical_cores": psutil.cpu_count(logical=False),
-            "total_memory_bytes": psutil.virtual_memory().total,
+            "logical_cores": _logical_cpu_count(),
+            "physical_cores": _physical_cpu_count(),
+            "total_memory_bytes": _total_memory_bytes(),
         },
         "results": [],
     }
@@ -464,7 +541,7 @@ def format_results_table(results: Iterable[BenchmarkResult]) -> str:
         rows.append(
             [
                 result.backend,
-                Path(result.model).name if Path(result.model).exists() else result.model,
+                short_model_name(result.model),
                 result.num_threads or "-",
                 f"{result.load_time_s:.2f}",
                 f"{result.generate_time_s:.2f}",

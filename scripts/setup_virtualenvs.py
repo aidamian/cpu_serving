@@ -7,6 +7,7 @@ import argparse
 import sys
 from typing import Iterable
 
+from cpu_serving.console import log_color
 from cpu_serving.venv_manager import (
     VirtualEnvError,
     available_backends,
@@ -58,7 +59,7 @@ def main() -> int:
         return 1
 
     for backend in backends:
-        print(f"Preparing backend '{backend}'...")
+        log_color(f"Preparing backend '{backend}'...", "b")
         try:
             handle = ensure_virtualenv(
                 backend,
@@ -70,10 +71,10 @@ def main() -> int:
             print(f"Failed to prepare backend '{backend}': {exc}", file=sys.stderr)
             return 2
 
-        print(f"  venv path : {handle.path}")
-        print(f"  interpreter : {handle.python}")
+        log_color(f"  venv path : {handle.path}", "d")
+        log_color(f"  interpreter : {handle.python}", "d")
         if args.skip_sync:
-            print("  dependencies were not updated (--skip-sync).")
+            log_color("  dependencies were not updated (--skip-sync).", "y")
 
     return 0
 

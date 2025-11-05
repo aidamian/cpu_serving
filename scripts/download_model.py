@@ -8,6 +8,7 @@ import os
 import sys
 from pathlib import Path
 
+from cpu_serving.console import log_color
 
 def _resolve_token(explicit: str | None) -> str:
     if explicit:
@@ -124,7 +125,7 @@ def download_model(args: argparse.Namespace) -> Path:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     snapshot_path = download_model(args)
-    print(f"Snapshot ready at: {snapshot_path}")
+    log_color(f"Snapshot ready at: {snapshot_path}", "g")
     return 0
 
 

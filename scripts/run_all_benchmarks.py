@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
 
+from cpu_serving.benchmarks import short_model_name
+from cpu_serving.console import log_color
 from cpu_serving.venv_manager import (
     VirtualEnvError,
     available_backends,
@@ -18,8 +20,11 @@ from cpu_serving.venv_manager import (
     resolve_backend,
 )
 
-_DEFAULT_PROMPT = "Quick CPU smoke-test prompt for the Hugging Face backend."
-_DEFAULT_MAX_NEW_TOKENS = 8
+_DEFAULT_PROMPT = (
+    "Write the DDL SQL for the definition of user accounts table. "
+    "Output only the viable SQL."
+)
+_DEFAULT_MAX_NEW_TOKENS = 250
 _DEFAULT_NUM_THREADS = 2
 _DEFAULT_MODEL_ID = "meta-llama/Llama-3.2-1B"
 _DEFAULT_LLAMACPP_MODEL = (
@@ -373,7 +378,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     failures: List[Dict[str, object]] = []
 
     for backend in backends:
-        print(f"\n=== Running backend: {backend} ===")
+        log_color(f"\n=== Running backend: {backend} ===", "b")
         try:
             handle = ensure_virtualenv(
                 backend,
@@ -390,7 +395,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_path = backend_dir / f"{timestamp}{label_suffix}.json"
 
         cmd = _build_backend_command(backend, handle.python, args, output_path)
-        print(f"Executing: {' '.join(cmd)}")
+        log_color(f"Executing: {' '.join(cmd)}", "d")
         try:
             subprocess.run(cmd, check=True, cwd=Path(__file__).resolve().parent.parent)
         except subprocess.CalledProcessError as exc:
@@ -428,7 +433,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             summary_rows.append(
                 [
                     backend,
-                    str(result.get("model", "")),
+                    short_model_name(result.get("model") or ""),
                     str(result.get("num_threads") or "-"),
                     f"{float(result.get('load_time_s', 0.0)):.2f}",
                     f"{float(result.get('generate_time_s', 0.0)):.2f}",
@@ -449,8 +454,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Tok/s",
             "Peak Mem (MiB)",
         ]
-        print("\n=== Summary ===")
-        print(_format_table(headers, summary_rows))
+        log_color("\n=== Summary ===", "b")
+        log_color(_format_table(headers, summary_rows), "g")
 
     summary_payload = {
         "generated_at": datetime.utcnow().isoformat() + "Z",
@@ -462,10 +467,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     summary_path = args.output_dir / f"summary_{timestamp}{label_suffix}.json"
     summary_path.write_text(json.dumps(summary_payload, indent=2), encoding="utf-8")
-    print(f"\nSaved combined results to {summary_path}")
+    log_color(f"\nSaved combined results to {summary_path}", "g")
 
     if args.print_json:
-        print(json.dumps(summary_payload, indent=2))
+        log_color(json.dumps(summary_payload, indent=2), "d")
 
     if failures:
         print(
