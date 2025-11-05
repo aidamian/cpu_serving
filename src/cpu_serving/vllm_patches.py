@@ -13,6 +13,9 @@ from uuid import uuid4
 
 _CPU_TOPOLOGY_PATCHED = False
 _IPC_PATCHED = False
+_TORCH_THREADS_PATCHED = False
+_CPU_PLATFORM_PATCHED = False
+_CACHE_ROOT_PATCHED = False
 
 
 def patch_cpu_topology() -> bool:
@@ -163,7 +166,92 @@ def ensure_vllm_ipc_support() -> bool:
     return patched
 
 
-def apply_all() -> Tuple[bool, bool]:
+def ensure_torch_thread_binding_stub() -> bool:
+    """Provide a no-op torch operator when custom CPU thread binding is absent."""
+
+    global _TORCH_THREADS_PATCHED
+    if _TORCH_THREADS_PATCHED:
+        return False
+
+    try:
+        import torch
+    except ImportError:
+        return False
+
+    namespace = getattr(torch.ops, "_C_utils", None)
+    if namespace is None or hasattr(namespace, "init_cpu_threads_env"):
+        return False
+
+    def _stub(cpu_spec: str) -> None:
+        return None
+
+    setattr(namespace, "init_cpu_threads_env", _stub)
+    _TORCH_THREADS_PATCHED = True
+    return True
+
+
+def ensure_cpu_platform() -> bool:
+    """Ensure the global platform object behaves like the CPU backend."""
+
+    global _CPU_PLATFORM_PATCHED
+    if _CPU_PLATFORM_PATCHED:
+        return False
+
+    try:
+        from vllm import platforms as vllm_platforms  # type: ignore
+        from vllm.platforms.cpu import CpuPlatform  # type: ignore
+    except ImportError:
+        return False
+
+    current = vllm_platforms.current_platform
+    if current.is_cpu():
+        _CPU_PLATFORM_PATCHED = True
+        return True
+
+    current.__class__ = CpuPlatform  # type: ignore[misc]
+    current.device_type = "cpu"
+    current.device_name = "cpu"
+    current.dispatch_key = "CPU"
+    current.dist_backend = "gloo"
+    current._enum = CpuPlatform._enum  # type: ignore[attr-defined]
+    _CPU_PLATFORM_PATCHED = True
+    return True
+
+
+def ensure_vllm_cache_root() -> bool:
+    """Point vLLM cache lookups at a writable workspace directory."""
+
+    global _CACHE_ROOT_PATCHED
+    if _CACHE_ROOT_PATCHED:
+        return False
+
+    if os.environ.get("VLLM_CACHE_ROOT"):
+        _CACHE_ROOT_PATCHED = True
+        return False
+
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+    except Exception:
+        repo_root = Path.cwd()
+
+    cache_root = repo_root / ".cache" / "vllm"
+    try:
+        cache_root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+
+    os.environ["VLLM_CACHE_ROOT"] = str(cache_root)
+    _CACHE_ROOT_PATCHED = True
+    return True
+
+
+def apply_all() -> Tuple[bool, bool, bool, bool, bool]:
     """Apply every available vLLM patch."""
 
-    return patch_cpu_topology(), ensure_vllm_ipc_support()
+    return (
+        ensure_vllm_cache_root(),
+        ensure_cpu_platform(),
+        patch_cpu_topology(),
+        ensure_vllm_ipc_support(),
+        ensure_torch_thread_binding_stub(),
+    )

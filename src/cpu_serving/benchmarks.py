@@ -13,7 +13,12 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import psutil
 
-from cpu_serving.vllm_patches import ensure_vllm_ipc_support, patch_cpu_topology
+from cpu_serving.vllm_patches import (
+    ensure_cpu_platform,
+    ensure_torch_thread_binding_stub,
+    ensure_vllm_ipc_support,
+    patch_cpu_topology,
+)
 
 
 DEFAULT_PROMPT = "Quick CPU smoke-test prompt for the Hugging Face backend."
@@ -262,6 +267,8 @@ def run_vllm_benchmark(config: VLLMBenchmarkConfig) -> BenchmarkResult:
             "vLLM CPU platform is unavailable; install a CPU-enabled build."
         ) from exc
 
+    os.environ.setdefault("VLLM_CPU_KVCACHE_SPACE", "8")
+
     _ensure_threads_config(config.num_threads)
     dtype = _normalize_dtype(config.dtype)
 
@@ -274,7 +281,9 @@ def run_vllm_benchmark(config: VLLMBenchmarkConfig) -> BenchmarkResult:
         current_platform.dist_backend = "gloo"
         current_platform._enum = CpuPlatform._enum
 
+    ensure_cpu_platform()
     patch_cpu_topology()
+    ensure_torch_thread_binding_stub()
     ensure_vllm_ipc_support()
 
     load_start = time.perf_counter()
