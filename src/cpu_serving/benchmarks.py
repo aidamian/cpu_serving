@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.metadata as importlib_metadata
 import json
 import os
 import platform
@@ -317,7 +318,11 @@ def _ensure_threads_config(num_threads: Optional[int]) -> None:
         import torch
 
         torch.set_num_threads(num_threads)
-        torch.set_num_interop_threads(max(1, num_threads // 2))
+        try:
+            torch.set_num_interop_threads(max(1, num_threads // 2))
+        except (AttributeError, RuntimeError):
+            # Some PyTorch builds/threads backends do not support interop thread tuning.
+            pass
     except ImportError:
         pass
 
@@ -394,10 +399,17 @@ def run_hf_benchmark(config: HFBenchmarkConfig) -> BenchmarkResult:
                 load_in_8bit=True,
                 llm_int8_enable_fp32_cpu_offload=config.bitsandbytes_int8_cpu_offload,
             )
+            quantization_detail = "fp32-offload" if config.bitsandbytes_int8_cpu_offload else "standard"
         else:  # pragma: no cover - defensive
             raise ValueError(f"Unsupported quantization mode '{quantization_mode}'.")
 
-        quant_config = BitsAndBytesConfig(**quant_kwargs)
+        try:
+            quant_config = BitsAndBytesConfig(**quant_kwargs)
+        except importlib_metadata.PackageNotFoundError as exc:
+            raise RuntimeError(
+                "bitsandbytes package was not found but is required for quantized HuggingFace benchmarks. "
+                "Re-run 'python scripts/setup_virtualenvs.py hf' to install dependencies."
+            ) from exc
         model_kwargs.update(
             device_map={"": "cpu"},
             quantization_config=quant_config,
@@ -750,11 +762,15 @@ def format_results_table(results: Iterable[BenchmarkResult]) -> str:
     rows: List[List[Any]] = []
     for result in results:
         parameters = result.parameters or {}
+        quant_label = parameters.get("quantization") or parameters.get("dtype") or "-"
+        quant_detail = parameters.get("quantization_detail")
+        if quant_label != "-" and quant_detail:
+            quant_label = f"{quant_label} ({quant_detail})"
         rows.append(
             [
                 result.backend,
                 short_model_name(result.model),
-                parameters.get("quantization") or parameters.get("dtype") or "-",
+                quant_label,
                 result.num_threads or "-",
                 f"{result.load_time_s:.2f}",
                 f"{result.generate_time_s:.2f}",

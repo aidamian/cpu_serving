@@ -46,10 +46,13 @@ HF_REPO_ID="${HF_REPO_ID:-${DEFAULT_HF_REPO_ID}}"
 MODEL_ID="${MODEL_ID:-${HF_MODEL_ID:-${DEFAULT_HF_MODEL_PATH}}}"
 DEFAULT_LLAMACPP_DIR="${ROOT_DIR}/models/hugging-quants--Llama-3.2-1B-Instruct-Q4_K_M-GGUF"
 LLAMACPP_MODEL_PATH="${LLAMACPP_MODEL_PATH:-${DEFAULT_LLAMACPP_DIR}/llama-3.2-1b-instruct-q4_k_m.gguf}"
-LLAMACPP_REPO_ID="${LLAMACPP_REPO_ID:-hugging-quants/Llama-3.2-1B-Instruct-GGUF}"
+DEFAULT_LLAMACPP_REPO_ID="hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF"
+LLAMACPP_REPO_ID="${LLAMACPP_REPO_ID:-${DEFAULT_LLAMACPP_REPO_ID}}"
 DEFAULT_LLAMACPP_Q8_DIR="${ROOT_DIR}/models/hugging-quants--Llama-3.2-1B-Instruct-Q8_0-GGUF"
 DEFAULT_LLAMACPP_Q8_PATH="${DEFAULT_LLAMACPP_Q8_DIR}/llama-3.2-1b-instruct-q8_0.gguf"
 LLAMACPP_Q8_MODEL_PATH="${LLAMACPP_Q8_MODEL_PATH:-${DEFAULT_LLAMACPP_Q8_PATH}}"
+DEFAULT_LLAMACPP_Q8_REPO_ID="hugging-quants/Llama-3.2-1B-Instruct-Q8_0-GGUF"
+LLAMACPP_Q8_REPO_ID="${LLAMACPP_Q8_REPO_ID:-${DEFAULT_LLAMACPP_Q8_REPO_ID}}"
 SYNC_VENVS="${SIMPLE_TEST_SYNC_VENVS:-0}"
 CONTINUE_ON_ERROR="${SIMPLE_TEST_CONTINUE_ON_ERROR:-1}"
 
@@ -141,6 +144,7 @@ ensure_llamacpp_model() {
   local target_file
   target_file="$(basename "${LLAMACPP_MODEL_PATH}")"
 
+  mkdir -p "${target_dir}"
   echo "Downloading primary llama.cpp GGUF '${target_file}'..." >&2
   run_download_model "${LLAMACPP_REPO_ID}" "${target_dir}" --allow-pattern "${target_file}" || true
   if [[ -f "${LLAMACPP_MODEL_PATH}" ]]; then
@@ -149,12 +153,22 @@ ensure_llamacpp_model() {
 
   local hf_cli="${VIRTUALENV_HOME}/venv-hf/bin/huggingface-cli"
   if [[ -x "${hf_cli}" ]]; then
+    local repos=("${LLAMACPP_REPO_ID}")
+    if [[ "${LLAMACPP_REPO_ID}" != "hugging-quants/Llama-3.2-1B-Instruct-GGUF" ]]; then
+      repos+=("hugging-quants/Llama-3.2-1B-Instruct-GGUF")
+    fi
+    repos+=("TheBloke/Llama-3.2-1B-Instruct-GGUF")
     set +e
-    "${hf_cli}" download "${LLAMACPP_REPO_ID}" \
-      --include "${target_file}" \
-      --revision main \
-      --local-dir "${target_dir}" \
-      --local-dir-use-symlinks False >/dev/null 2>&1
+    for repo in "${repos[@]}"; do
+      "${hf_cli}" download "${repo}" \
+        --include "${target_file}" \
+        --revision main \
+        --local-dir "${target_dir}" \
+        --local-dir-use-symlinks False >/dev/null 2>&1
+      if [[ -f "${LLAMACPP_MODEL_PATH}" ]]; then
+        break
+      fi
+    done
     set -e
   fi
 }
@@ -163,6 +177,28 @@ ensure_venv_ready "hf"
 ensure_venv_ready "vllm"
 ensure_venv_ready "llamacpp"
 
+ensure_hf_quantization_deps() {
+  local hf_python
+  hf_python="$(_venv_python_path "${VIRTUALENV_HOME}/venv-hf")"
+  if [[ ! -x "${hf_python}" ]]; then
+    return
+  fi
+
+  if "${hf_python}" -m pip show bitsandbytes >/dev/null 2>&1; then
+    return
+  fi
+
+  echo "bitsandbytes not detected in Hugging Face virtualenv; syncing dependencies..." >&2
+  if ! python3 "${ROOT_DIR}/scripts/setup_virtualenvs.py" hf; then
+    echo "warning: failed to sync Hugging Face virtualenv; continuing anyway." >&2
+  fi
+  if ! "${hf_python}" -m pip show bitsandbytes >/dev/null 2>&1; then
+    echo "error: bitsandbytes is required for Hugging Face quantized benchmarks. Run 'python scripts/setup_virtualenvs.py hf --reinstall' manually." >&2
+    exit 1
+  fi
+}
+
+ensure_hf_quantization_deps
 ensure_hf_model
 
 if [[ ! -d "${MODEL_ID}" ]]; then
@@ -199,7 +235,7 @@ ensure_llamacpp_q8_model() {
   q8_filename="$(basename "${DEFAULT_LLAMACPP_Q8_PATH}")"
   if [[ "${LLAMACPP_Q8_MODEL_PATH}" == "${DEFAULT_LLAMACPP_Q8_PATH}" ]]; then
     echo "Downloading llama.cpp int8 GGUF '${q8_filename}'..." >&2
-    run_download_model "${LLAMACPP_REPO_ID}" "${DEFAULT_LLAMACPP_Q8_DIR}" --allow-pattern "${q8_filename}" || true
+    run_download_model "${LLAMACPP_Q8_REPO_ID}" "${DEFAULT_LLAMACPP_Q8_DIR}" --allow-pattern "${q8_filename}" || true
     if [[ -f "${DEFAULT_LLAMACPP_Q8_PATH}" ]]; then
       LLAMACPP_Q8_MODEL_PATH="${DEFAULT_LLAMACPP_Q8_PATH}"
       export LLAMACPP_Q8_MODEL_PATH
@@ -207,10 +243,13 @@ ensure_llamacpp_q8_model() {
     fi
   fi
   local hf_cli="${VIRTUALENV_HOME}/venv-hf/bin/huggingface-cli"
-  local repos=(
-    "hugging-quants/Llama-3.2-1B-Instruct-GGUF"
-    "TheBloke/Llama-3.2-1B-Instruct-GGUF"
-  )
+  local repos=("${LLAMACPP_Q8_REPO_ID}")
+  if [[ "${LLAMACPP_Q8_REPO_ID}" != "hugging-quants/Llama-3.2-1B-Instruct-GGUF" ]]; then
+    repos+=("hugging-quants/Llama-3.2-1B-Instruct-GGUF")
+  fi
+  if [[ "${LLAMACPP_Q8_REPO_ID}" != "TheBloke/Llama-3.2-1B-Instruct-GGUF" ]]; then
+    repos+=("TheBloke/Llama-3.2-1B-Instruct-GGUF")
+  fi
 
   if [[ -x "${hf_cli}" ]]; then
     for repo in "${repos[@]}"; do

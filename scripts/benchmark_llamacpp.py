@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -162,6 +163,14 @@ def main() -> None:
             if not name or not path:
                 parser.error(f"Invalid --quantization value '{entry}'. Expected NAME=PATH.")
             quantizations[name] = path
+
+    env_int8_path = os.environ.get("LLAMACPP_Q8_MODEL_PATH")
+    if env_int8_path:
+        env_int8_path = env_int8_path.strip()
+        if env_int8_path and "int8" not in quantizations:
+            candidate = Path(env_int8_path)
+            if candidate.is_file() and str(candidate) != args.model_path:
+                quantizations["int8"] = str(candidate)
 
     config = LlamaCppBenchmarkConfig(
         model_path=args.model_path,

@@ -499,11 +499,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         for result in payload.get("results", []):
             combined_results.append(result)
             parameters = result.get("parameters") or {}
+            quant_label = parameters.get("quantization") or parameters.get("dtype") or "-"
+            quant_detail = parameters.get("quantization_detail")
+            if quant_label != "-" and quant_detail:
+                quant_label = f"{quant_label} ({quant_detail})"
             summary_rows.append(
                 [
                     backend,
                     short_model_name(result.get("model") or ""),
-                    str(parameters.get("quantization") or parameters.get("dtype") or "-"),
+                    str(quant_label),
                     str(result.get("num_threads") or "-"),
                     f"{float(result.get('load_time_s', 0.0)):.2f}",
                     f"{float(result.get('generate_time_s', 0.0)):.2f}",

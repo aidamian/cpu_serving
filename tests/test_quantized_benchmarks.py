@@ -10,8 +10,10 @@ from unittest import mock
 
 
 from cpu_serving.benchmarks import (
+    BenchmarkResult,
     HFBenchmarkConfig,
     LlamaCppBenchmarkConfig,
+    format_results_table,
     run_hf_quantized_benchmarks,
     run_llamacpp_quantized_benchmarks,
 )
@@ -178,14 +180,25 @@ class QuantizedBenchmarksTest(unittest.TestCase):
         fake_transformers.AutoModelForCausalLM = FakeAutoModel
         fake_transformers.BitsAndBytesConfig = FakeBitsAndBytesConfig
         self.transformers_patch = mock.patch.dict(sys.modules, {"transformers": fake_transformers})
+        fake_tabulate_module = types.ModuleType("tabulate")
+
+        def _fake_tabulate(rows, headers, tablefmt=None):
+            header_line = " | ".join(headers)
+            body_lines = [" | ".join(str(value) for value in row) for row in rows]
+            return "\n".join([header_line, *body_lines])
+
+        fake_tabulate_module.tabulate = _fake_tabulate
+        self.tabulate_patch = mock.patch.dict(sys.modules, {"tabulate": fake_tabulate_module})
         self.monitor_patch.start()
         self.threads_patch.start()
         self.torch_patch.start()
         self.transformers_patch.start()
+        self.tabulate_patch.start()
         self.addCleanup(self.monitor_patch.stop)
         self.addCleanup(self.threads_patch.stop)
         self.addCleanup(self.torch_patch.stop)
         self.addCleanup(self.transformers_patch.stop)
+        self.addCleanup(self.tabulate_patch.stop)
 
     def test_llamacpp_quantized_benchmarks(self) -> None:
         FakeLlama.instances = []
@@ -234,11 +247,51 @@ class QuantizedBenchmarksTest(unittest.TestCase):
         self.assertEqual(len(results), 2)
         quantizations = [result.parameters.get("quantization") for result in results]
         self.assertEqual(quantizations, ["int4", "int8"])
+        self.assertEqual(results[0].parameters.get("quantization_detail"), "nf4")
+        self.assertEqual(results[1].parameters.get("quantization_detail"), "standard")
         self.assertEqual(len(FakeAutoModel.calls), 2)
         four_bit_config = FakeAutoModel.calls[0]["quantization_config"].kwargs
         eight_bit_config = FakeAutoModel.calls[1]["quantization_config"].kwargs
         self.assertTrue(four_bit_config.get("load_in_4bit"))
         self.assertTrue(eight_bit_config.get("load_in_8bit"))
+
+    def test_hf_bitsandbytes_int8_offload_detail(self) -> None:
+        FakeAutoModel.calls = []
+
+        config = HFBenchmarkConfig(
+            model_id="dummy/model",
+            tokenizer_id="dummy/model",
+            prompt="Hi",
+            bitsandbytes_int8_cpu_offload=True,
+        )
+
+        results = run_hf_quantized_benchmarks(
+            config,
+            quantizations=["int8"],
+        )
+
+        self.assertEqual(len(results), 1)
+        result = results[0]
+        self.assertEqual(result.parameters.get("quantization"), "int8")
+        self.assertEqual(result.parameters.get("quantization_detail"), "fp32-offload")
+
+    def test_format_results_table_includes_quantization_detail(self) -> None:
+        result = BenchmarkResult(
+            backend="huggingface",
+            model="dummy/model",
+            prompt="Hi",
+            prompt_tokens=5,
+            completion="completion",
+            completion_tokens=7,
+            max_new_tokens=10,
+            load_time_s=1.23,
+            generate_time_s=0.5,
+            peak_memory_bytes=2_000_000,
+            num_threads=2,
+            parameters={"quantization": "int4", "quantization_detail": "nf4"},
+        )
+        table = format_results_table([result])
+        self.assertIn("int4 (nf4)", table)
 
 
 if __name__ == "__main__":  # pragma: no cover

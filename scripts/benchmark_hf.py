@@ -170,11 +170,16 @@ def main() -> None:
         warmup_tokens=args.warmup_tokens,
     )
 
-    quantization_modes: List[str] = args.quantizations or []
-    if quantization_modes:
-        results = run_hf_quantized_benchmarks(config, quantizations=quantization_modes)
+    quantization_modes: List[str]
+    if args.quantizations is None:
+        quantization_modes = ["int4", "int8"]
     else:
-        results = [run_hf_benchmark(config)]
+        quantization_modes = args.quantizations
+
+    results = [run_hf_benchmark(config)]
+    if quantization_modes:
+        quantized_results = run_hf_quantized_benchmarks(config, quantizations=quantization_modes)
+        results.extend(quantized_results)
 
     log_color(format_results_table(results), "b")
     print("", flush=True)
