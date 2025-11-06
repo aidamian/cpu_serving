@@ -6,13 +6,14 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from cpu_serving.benchmarks import (
     HFBenchmarkConfig,
     aggregate_results,
     format_results_table,
     run_hf_benchmark,
+    run_hf_quantized_benchmarks,
     write_results,
 )
 from cpu_serving.console import log_color
@@ -42,6 +43,33 @@ def build_parser() -> argparse.ArgumentParser:
         "--dtype",
         default="float32",
         help="Torch dtype to use (float32, bfloat16, float16). Defaults to float32.",
+    )
+    parser.add_argument(
+        "--quantize",
+        dest="quantizations",
+        action="append",
+        choices=["int4", "int8"],
+        help="Add a bitsandbytes quantization run (int4 or int8). Provide multiple times to benchmark several modes.",
+    )
+    parser.add_argument(
+        "--bitsandbytes-compute-dtype",
+        default=defaults.bitsandbytes_compute_dtype,
+        help="Compute dtype for bitsandbytes quantization (float16, float32, bfloat16).",
+    )
+    parser.add_argument(
+        "--bitsandbytes-quant-type",
+        default=defaults.bitsandbytes_quant_type,
+        help="4-bit quantization type for bitsandbytes (e.g. nf4, fp4).",
+    )
+    parser.add_argument(
+        "--bitsandbytes-disable-double-quant",
+        action="store_true",
+        help="Disable double quantization when running 4-bit benchmarks.",
+    )
+    parser.add_argument(
+        "--bitsandbytes-int8-cpu-offload",
+        action="store_true",
+        help="Enable FP32 CPU offload for int8 quantization runs.",
     )
     parser.add_argument(
         "--prompt",
@@ -128,6 +156,10 @@ def main() -> None:
         revision=args.revision,
         tokenizer_id=args.tokenizer_id,
         dtype=args.dtype,
+        bitsandbytes_compute_dtype=args.bitsandbytes_compute_dtype,
+        bitsandbytes_quant_type=args.bitsandbytes_quant_type,
+        bitsandbytes_use_double_quant=not args.bitsandbytes_disable_double_quant,
+        bitsandbytes_int8_cpu_offload=args.bitsandbytes_int8_cpu_offload,
         prompt=prompt or default_prompt,
         max_new_tokens=args.max_new_tokens,
         num_threads=args.num_threads,
@@ -138,14 +170,21 @@ def main() -> None:
         warmup_tokens=args.warmup_tokens,
     )
 
-    result = run_hf_benchmark(config)
+    quantization_modes: List[str] = args.quantizations or []
+    if quantization_modes:
+        results = run_hf_quantized_benchmarks(config, quantizations=quantization_modes)
+    else:
+        results = [run_hf_benchmark(config)]
 
-    log_color(format_results_table([result]), "b")
+    log_color(format_results_table(results), "b")
     print("", flush=True)
-    log_color("Completion preview:", "y")
-    log_color(result.completion, "g")
+    for result in results:
+        label = result.parameters.get("quantization") or result.parameters.get("dtype") or "default"
+        log_color(f"[{label}] Completion preview:", "y")
+        log_color(result.completion, "g")
+        print("", flush=True)
 
-    payload = aggregate_results([result])
+    payload = aggregate_results(results)
 
     if args.output:
         write_results(payload, args.output)

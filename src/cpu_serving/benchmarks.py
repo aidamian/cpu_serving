@@ -3,14 +3,15 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 try:
     import psutil  # type: ignore
@@ -35,6 +36,17 @@ DEFAULT_PROMPT = (
     "Output only the viable SQL."
 )
 
+_QUANTIZATION_PATTERN = re.compile(r"q(?P<bits>\d+)(?P<suffix>[_a-z0-9-]*)", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class LlamaCppQuantizationSpec:
+    """Description for a llama.cpp quantized model variant."""
+
+    name: str
+    detail: str
+    model_path: str
+
 
 def short_model_name(model: str | os.PathLike[str]) -> str:
     text = str(model).rstrip("/\\")
@@ -43,6 +55,24 @@ def short_model_name(model: str | os.PathLike[str]) -> str:
     normalized = text.replace("\\", "/")
     short = normalized.split("/")[-1]
     return short or normalized
+
+
+def _infer_quantization_labels(path: str, explicit_name: str | None = None) -> Tuple[str, str]:
+    """Infer a friendly quantization name/detail pair from a GGUF file path."""
+    filename = Path(path).name.lower()
+    match = _QUANTIZATION_PATTERN.search(filename)
+    detail = ""
+    if match:
+        detail = match.group(0).lower()
+        bits = match.group("bits")
+        inferred = f"int{bits}"
+    else:
+        inferred = "unquantized"
+    if explicit_name:
+        inferred = explicit_name
+    if not detail:
+        detail = explicit_name or detail
+    return inferred, detail
 
 
 def _read_rss_bytes(process: Any | None = None) -> int:
@@ -200,6 +230,11 @@ class HFBenchmarkConfig(BaseBenchmarkConfig):
     dtype: str = "float32"
     trust_remote_code: bool = False
     tokenizer_id: Optional[str] = None
+    quantization_mode: Optional[str] = None
+    bitsandbytes_compute_dtype: str = "float16"
+    bitsandbytes_quant_type: str = "nf4"
+    bitsandbytes_use_double_quant: bool = True
+    bitsandbytes_int8_cpu_offload: bool = False
 
 
 @dataclass
@@ -221,6 +256,54 @@ class LlamaCppBenchmarkConfig(BaseBenchmarkConfig):
     n_ctx: int = 4096
     n_batch: int = 512
     seed: int = 42
+    quantization_name: Optional[str] = None
+    quantization_detail: Optional[str] = None
+    quantizations: Dict[str, str] = field(default_factory=dict)
+    auto_discover_quantizations: bool = True
+
+
+def _collect_llamacpp_quantizations(config: LlamaCppBenchmarkConfig) -> List[LlamaCppQuantizationSpec]:
+    """Resolve the set of quantized GGUF files that should be benchmarked."""
+
+    specs: List[LlamaCppQuantizationSpec] = []
+    seen_paths: Set[str] = set()
+
+    def _add(path: str, explicit_name: Optional[str] = None, explicit_detail: Optional[str] = None) -> None:
+        resolved = str(Path(path))
+        if resolved in seen_paths:
+            return
+        candidate = Path(resolved)
+        if not candidate.exists():
+            raise FileNotFoundError(
+                f"Quantized llama.cpp model '{resolved}' was not found. "
+                "Provide valid GGUF paths for quantized benchmarks."
+            )
+        if not candidate.is_file():
+            raise FileNotFoundError(
+                f"Quantized llama.cpp model '{resolved}' is not a file. "
+                "Provide valid GGUF file paths."
+            )
+        name, detail = _infer_quantization_labels(resolved, explicit_name)
+        if explicit_detail:
+            detail = explicit_detail
+        specs.append(LlamaCppQuantizationSpec(name=name, detail=detail or "", model_path=resolved))
+        seen_paths.add(resolved)
+
+    if config.model_path:
+        _add(config.model_path, config.quantization_name, config.quantization_detail)
+
+    for explicit_name, path in config.quantizations.items():
+        _add(path, explicit_name)
+
+    if config.auto_discover_quantizations and config.model_path:
+        root = Path(config.model_path).resolve().parent
+        for candidate in sorted(root.glob("*.gguf")):
+            _add(str(candidate))
+
+    # If we only discovered one quantization variant and the caller explicitly
+    # requested different ones, we still return the single entry so the caller
+    # can decide how to handle it.
+    return specs
 
 
 def _ensure_threads_config(num_threads: Optional[int]) -> None:
@@ -259,6 +342,12 @@ def run_hf_benchmark(config: HFBenchmarkConfig) -> BenchmarkResult:
         "float16": torch.float16,
     }[dtype]
 
+    quantization_mode = (config.quantization_mode or "").strip().lower() or None
+    if quantization_mode in {"q4", "4bit"}:
+        quantization_mode = "int4"
+    elif quantization_mode in {"q8", "8bit"}:
+        quantization_mode = "int8"
+
     model_id = config.model_id
     tokenizer_id = config.tokenizer_id or model_id
 
@@ -268,13 +357,62 @@ def run_hf_benchmark(config: HFBenchmarkConfig) -> BenchmarkResult:
         revision=config.revision,
         use_fast=True,
     )
+
+    model_kwargs: Dict[str, Any] = {
+        "revision": config.revision,
+        "trust_remote_code": config.trust_remote_code,
+    }
+    quantization_detail: Optional[str] = None
+
+    if quantization_mode:
+        try:
+            from transformers import BitsAndBytesConfig
+        except ImportError as exc:  # pragma: no cover - defensive
+            raise RuntimeError(
+                "bitsandbytes quantization requested for HuggingFace backend but transformers "
+                "could not import BitsAndBytesConfig. Ensure bitsandbytes is installed."
+            ) from exc
+
+        compute_dtype_key = _normalize_dtype(config.bitsandbytes_compute_dtype)
+        compute_dtype = {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+        }[compute_dtype_key]
+
+        quant_kwargs: Dict[str, Any] = {}
+        if quantization_mode == "int4":
+            quant_kwargs.update(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=compute_dtype,
+                bnb_4bit_use_double_quant=config.bitsandbytes_use_double_quant,
+                bnb_4bit_quant_type=config.bitsandbytes_quant_type,
+            )
+            quantization_detail = config.bitsandbytes_quant_type
+        elif quantization_mode == "int8":
+            quant_kwargs.update(
+                load_in_8bit=True,
+                llm_int8_enable_fp32_cpu_offload=config.bitsandbytes_int8_cpu_offload,
+            )
+        else:  # pragma: no cover - defensive
+            raise ValueError(f"Unsupported quantization mode '{quantization_mode}'.")
+
+        quant_config = BitsAndBytesConfig(**quant_kwargs)
+        model_kwargs.update(
+            device_map={"": "cpu"},
+            quantization_config=quant_config,
+            torch_dtype=compute_dtype,
+        )
+    else:
+        model_kwargs.update(
+            torch_dtype=torch_dtype,
+            device_map="cpu",
+            low_cpu_mem_usage=True,
+        )
+
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        revision=config.revision,
-        torch_dtype=torch_dtype,
-        device_map="cpu",
-        low_cpu_mem_usage=True,
-        trust_remote_code=config.trust_remote_code,
+        **model_kwargs,
     )
     load_time = time.perf_counter() - load_start
 
@@ -312,6 +450,24 @@ def run_hf_benchmark(config: HFBenchmarkConfig) -> BenchmarkResult:
         output_ids[0][prompt_tokens:], skip_special_tokens=True
     )
 
+    parameters: Dict[str, Any] = {
+        "dtype": dtype,
+        "revision": config.revision,
+        "temperature": config.temperature,
+        "top_p": config.top_p,
+        "repetition_penalty": config.repetition_penalty,
+    }
+    if quantization_mode:
+        parameters["quantization"] = quantization_mode
+        if quantization_detail:
+            parameters["quantization_detail"] = quantization_detail
+        parameters["bitsandbytes_compute_dtype"] = config.bitsandbytes_compute_dtype
+        if quantization_mode == "int4":
+            parameters["bitsandbytes_quant_type"] = config.bitsandbytes_quant_type
+            parameters["bitsandbytes_use_double_quant"] = config.bitsandbytes_use_double_quant
+        if quantization_mode == "int8":
+            parameters["bitsandbytes_int8_cpu_offload"] = config.bitsandbytes_int8_cpu_offload
+
     return BenchmarkResult(
         backend="huggingface",
         model=model_id,
@@ -324,13 +480,7 @@ def run_hf_benchmark(config: HFBenchmarkConfig) -> BenchmarkResult:
         generate_time_s=generate_time,
         peak_memory_bytes=monitor.max_rss_bytes,
         num_threads=config.num_threads,
-        parameters={
-            "dtype": dtype,
-            "revision": config.revision,
-            "temperature": config.temperature,
-            "top_p": config.top_p,
-            "repetition_penalty": config.repetition_penalty,
-        },
+        parameters=parameters,
     )
 
 
@@ -434,9 +584,13 @@ def run_llamacpp_benchmark(config: LlamaCppBenchmarkConfig) -> BenchmarkResult:
 
     _ensure_threads_config(config.num_threads)
 
+    model_path = config.model_path
+    if not model_path:
+        raise ValueError("llama.cpp benchmark requires a GGUF model path.")
+
     load_start = time.perf_counter()
     llm = Llama(
-        model_path=config.model_path,
+        model_path=model_path,
         n_ctx=config.n_ctx,
         n_batch=config.n_batch,
         n_threads=config.num_threads or os.cpu_count() or 1,
@@ -472,9 +626,22 @@ def run_llamacpp_benchmark(config: LlamaCppBenchmarkConfig) -> BenchmarkResult:
     completion_tokens = int(usage.get("completion_tokens", 0))
     completion = output["choices"][0]["text"].strip()
 
+    parameters: Dict[str, Any] = {
+        "n_ctx": config.n_ctx,
+        "n_batch": config.n_batch,
+        "seed": config.seed,
+        "temperature": config.temperature,
+        "top_p": config.top_p,
+        "repetition_penalty": config.repetition_penalty,
+    }
+    if config.quantization_name:
+        parameters["quantization"] = config.quantization_name
+    if config.quantization_detail:
+        parameters["quantization_detail"] = config.quantization_detail
+
     return BenchmarkResult(
         backend="llama.cpp",
-        model=config.model_path,
+        model=model_path,
         prompt=config.prompt,
         prompt_tokens=prompt_tokens,
         completion=completion,
@@ -484,15 +651,58 @@ def run_llamacpp_benchmark(config: LlamaCppBenchmarkConfig) -> BenchmarkResult:
         generate_time_s=generate_time,
         peak_memory_bytes=monitor.max_rss_bytes,
         num_threads=config.num_threads or os.cpu_count() or 1,
-        parameters={
-            "n_ctx": config.n_ctx,
-            "n_batch": config.n_batch,
-            "seed": config.seed,
-            "temperature": config.temperature,
-            "top_p": config.top_p,
-            "repetition_penalty": config.repetition_penalty,
-        },
+        parameters=parameters,
     )
+
+
+def run_llamacpp_quantized_benchmarks(
+    config: LlamaCppBenchmarkConfig,
+    quantization_order: Optional[Sequence[str]] = None,
+) -> List[BenchmarkResult]:
+    """Run llama.cpp benchmark across multiple quantized GGUF weights."""
+
+    specs = _collect_llamacpp_quantizations(config)
+    if not specs:
+        raise ValueError(
+            "No quantized GGUF files were discovered for llama.cpp benchmarking. "
+            "Provide --quantization entries or disable auto discovery if not needed."
+        )
+
+    if quantization_order:
+        order_map = {name: idx for idx, name in enumerate(quantization_order)}
+        specs.sort(key=lambda spec: (order_map.get(spec.name, len(order_map)), spec.model_path))
+    else:
+        specs.sort(key=lambda spec: (spec.name, spec.model_path))
+
+    results: List[BenchmarkResult] = []
+    for spec in specs:
+        run_config = replace(
+            config,
+            model_path=spec.model_path,
+            quantization_name=spec.name,
+            quantization_detail=spec.detail,
+        )
+        result = run_llamacpp_benchmark(run_config)
+        results.append(result)
+    return results
+
+
+def run_hf_quantized_benchmarks(
+    config: HFBenchmarkConfig,
+    quantizations: Optional[Sequence[str]] = None,
+) -> List[BenchmarkResult]:
+    """Run HuggingFace benchmark with bitsandbytes quantization variants."""
+
+    desired = list(dict.fromkeys((quantizations or ["int4", "int8"])))
+    if not desired:
+        desired = ["int4", "int8"]
+
+    results: List[BenchmarkResult] = []
+    for quantization in desired:
+        run_config = replace(config, quantization_mode=quantization)
+        result = run_hf_benchmark(run_config)
+        results.append(result)
+    return results
 
 
 def aggregate_results(results: Iterable[BenchmarkResult]) -> Dict[str, Any]:
@@ -529,6 +739,7 @@ def format_results_table(results: Iterable[BenchmarkResult]) -> str:
     headers = [
         "Backend",
         "Model",
+        "Quantization",
         "Threads",
         "Load (s)",
         "Gen (s)",
@@ -538,10 +749,12 @@ def format_results_table(results: Iterable[BenchmarkResult]) -> str:
     ]
     rows: List[List[Any]] = []
     for result in results:
+        parameters = result.parameters or {}
         rows.append(
             [
                 result.backend,
                 short_model_name(result.model),
+                parameters.get("quantization") or parameters.get("dtype") or "-",
                 result.num_threads or "-",
                 f"{result.load_time_s:.2f}",
                 f"{result.generate_time_s:.2f}",

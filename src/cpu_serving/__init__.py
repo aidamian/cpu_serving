@@ -11,8 +11,10 @@ __all__ = [
     "LlamaCppBenchmarkConfig",
     "BenchmarkResult",
     "run_hf_benchmark",
+    "run_hf_quantized_benchmarks",
     "run_vllm_benchmark",
     "run_llamacpp_benchmark",
+    "run_llamacpp_quantized_benchmarks",
     "aggregate_results",
     "available_backends",
     "ensure_virtualenv",
@@ -25,8 +27,10 @@ _BENCHMARK_EXPORTS = {
     "LlamaCppBenchmarkConfig",
     "BenchmarkResult",
     "run_hf_benchmark",
+    "run_hf_quantized_benchmarks",
     "run_vllm_benchmark",
     "run_llamacpp_benchmark",
+    "run_llamacpp_quantized_benchmarks",
     "aggregate_results",
 }
 

@@ -191,6 +191,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=32,
         help="Warmup token count for HuggingFace.",
     )
+    parser.add_argument(
+        "--hf-quantize",
+        action="append",
+        choices=["int4", "int8"],
+        default=None,
+        help="Add bitsandbytes quantization runs for HuggingFace (int4/int8). Provide multiple times.",
+    )
+    parser.add_argument(
+        "--hf-bitsandbytes-compute-dtype",
+        default="float16",
+        help="Compute dtype for bitsandbytes quantization (float16, bfloat16, float32).",
+    )
+    parser.add_argument(
+        "--hf-bitsandbytes-quant-type",
+        default="nf4",
+        help="Quantization type for 4-bit bitsandbytes runs (e.g. nf4).",
+    )
+    parser.add_argument(
+        "--hf-bitsandbytes-disable-double-quant",
+        action="store_true",
+        help="Disable double quantization for 4-bit runs.",
+    )
+    parser.add_argument(
+        "--hf-bitsandbytes-int8-cpu-offload",
+        action="store_true",
+        help="Enable FP32 CPU offload for int8 bitsandbytes runs.",
+    )
 
     # vLLM options
     parser.add_argument(
@@ -283,6 +310,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=32,
         help="Warmup token count for llama.cpp.",
     )
+    parser.add_argument(
+        "--llamacpp-quantization",
+        action="append",
+        metavar="NAME=PATH",
+        default=None,
+        help="Additional quantized GGUF models for llama.cpp (forwarded to backend script).",
+    )
+    parser.add_argument(
+        "--llamacpp-quantization-name",
+        default=None,
+        help="Label for the primary llama.cpp model path (forwarded).",
+    )
+    parser.add_argument(
+        "--llamacpp-disable-auto-discover",
+        action="store_true",
+        help="Disable GGUF auto-discovery for llama.cpp benchmark.",
+    )
+    parser.add_argument(
+        "--llamacpp-quantization-order",
+        nargs="+",
+        default=None,
+        help="Ordering to report llama.cpp quantization labels.",
+    )
 
     return parser.parse_args(argv)
 
@@ -320,6 +370,15 @@ def _build_backend_command(
         if args.hf_tokenizer_id:
             cmd.extend(["--tokenizer-id", args.hf_tokenizer_id])
         cmd.extend(["--dtype", args.hf_dtype])
+        if args.hf_quantize:
+            for mode in args.hf_quantize:
+                cmd.extend(["--quantize", mode])
+        cmd.extend(["--bitsandbytes-compute-dtype", args.hf_bitsandbytes_compute_dtype])
+        cmd.extend(["--bitsandbytes-quant-type", args.hf_bitsandbytes_quant_type])
+        if args.hf_bitsandbytes_disable_double_quant:
+            cmd.append("--bitsandbytes-disable-double-quant")
+        if args.hf_bitsandbytes_int8_cpu_offload:
+            cmd.append("--bitsandbytes-int8-cpu-offload")
         if args.hf_num_threads is not None:
             cmd.extend(["--num-threads", str(args.hf_num_threads)])
         if args.hf_warmup:
@@ -346,6 +405,15 @@ def _build_backend_command(
                 "llama.cpp backend selected but --llamacpp-model-path was not provided."
             )
         cmd.extend(["--model-path", str(args.llamacpp_model_path)])
+        if args.llamacpp_quantization_name:
+            cmd.extend(["--quantization-name", args.llamacpp_quantization_name])
+        if args.llamacpp_quantization:
+            for item in args.llamacpp_quantization:
+                cmd.extend(["--quantization", item])
+        if args.llamacpp_disable_auto_discover:
+            cmd.append("--disable-auto-discover")
+        if args.llamacpp_quantization_order:
+            cmd.extend(["--quantization-order", *args.llamacpp_quantization_order])
         if args.llamacpp_num_threads is not None:
             cmd.extend(["--num-threads", str(args.llamacpp_num_threads)])
         cmd.extend(["--n-ctx", str(args.llamacpp_n_ctx)])
@@ -430,10 +498,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         backend_payloads[backend] = payload
         for result in payload.get("results", []):
             combined_results.append(result)
+            parameters = result.get("parameters") or {}
             summary_rows.append(
                 [
                     backend,
                     short_model_name(result.get("model") or ""),
+                    str(parameters.get("quantization") or parameters.get("dtype") or "-"),
                     str(result.get("num_threads") or "-"),
                     f"{float(result.get('load_time_s', 0.0)):.2f}",
                     f"{float(result.get('generate_time_s', 0.0)):.2f}",
@@ -447,6 +517,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         headers = [
             "Backend",
             "Model",
+            "Quantization",
             "Threads",
             "Load (s)",
             "Gen (s)",

@@ -6,13 +6,13 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from cpu_serving.benchmarks import (
     LlamaCppBenchmarkConfig,
     aggregate_results,
     format_results_table,
-    run_llamacpp_benchmark,
+    run_llamacpp_quantized_benchmarks,
     write_results,
 )
 from cpu_serving.console import log_color
@@ -27,6 +27,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--model-path",
         default=defaults.model_path,
         help="Path to the GGUF model file (e.g. Llama 3.2 1B quantized weights).",
+    )
+    parser.add_argument(
+        "--quantization-name",
+        default=None,
+        help="Optional label for the primary --model-path quantization (e.g. int4).",
+    )
+    parser.add_argument(
+        "--quantization",
+        action="append",
+        default=None,
+        metavar="NAME=PATH",
+        help=(
+            "Additional quantized GGUF model to benchmark, formatted as NAME=PATH. "
+            "Provide multiple times to benchmark several quantizations."
+        ),
+    )
+    parser.add_argument(
+        "--disable-auto-discover",
+        action="store_true",
+        help="Disable automatic discovery of sibling GGUF files alongside --model-path.",
+    )
+    parser.add_argument(
+        "--quantization-order",
+        nargs="+",
+        default=None,
+        help="Optional ordering for reported quantization labels (e.g. int4 int8).",
     )
     parser.add_argument(
         "--prompt",
@@ -125,8 +151,23 @@ def main() -> None:
     prompt = _load_prompt(args.prompt, args.prompt_file)
     default_prompt = LlamaCppBenchmarkConfig().prompt
 
+    quantizations: Dict[str, str] = {}
+    if args.quantization:
+        for entry in args.quantization:
+            if "=" not in entry:
+                parser.error(f"Invalid --quantization value '{entry}'. Expected NAME=PATH.")
+            name, path = entry.split("=", 1)
+            name = name.strip()
+            path = path.strip()
+            if not name or not path:
+                parser.error(f"Invalid --quantization value '{entry}'. Expected NAME=PATH.")
+            quantizations[name] = path
+
     config = LlamaCppBenchmarkConfig(
         model_path=args.model_path,
+        quantization_name=args.quantization_name,
+        quantizations=quantizations,
+        auto_discover_quantizations=not args.disable_auto_discover,
         prompt=prompt or default_prompt,
         max_new_tokens=args.max_new_tokens,
         n_ctx=args.n_ctx,
@@ -140,13 +181,16 @@ def main() -> None:
         warmup_tokens=args.warmup_tokens,
     )
 
-    result = run_llamacpp_benchmark(config)
-    log_color(format_results_table([result]), "b")
+    results = run_llamacpp_quantized_benchmarks(config, quantization_order=args.quantization_order)
+    log_color(format_results_table(results), "b")
     print("", flush=True)
-    log_color("Completion preview:", "y")
-    log_color(result.completion, "g")
+    for result in results:
+        label = result.parameters.get("quantization") or Path(result.model).name
+        log_color(f"[{label}] Completion preview:", "y")
+        log_color(result.completion, "g")
+        print("", flush=True)
 
-    payload = aggregate_results([result])
+    payload = aggregate_results(results)
     if args.output:
         write_results(payload, args.output)
         print("", flush=True)
